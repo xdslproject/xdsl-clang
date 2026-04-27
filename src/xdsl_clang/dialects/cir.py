@@ -22,6 +22,7 @@ from typing import cast
 from xdsl.dialects.builtin import (
     AnyFloat,
     ArrayAttr,
+    DenseArrayBase,
     FlatSymbolRefAttr,
     Float32Type,
     Float64Type,
@@ -31,9 +32,11 @@ from xdsl.dialects.builtin import (
     StringAttr,
     SymbolRefAttr,
     UnitAttr,
+    i32,
 )
 from xdsl.ir import (
     Attribute,
+    Block,
     Dialect,
     ParametrizedAttribute,
     Region,
@@ -119,12 +122,20 @@ class SingleType(ParametrizedAttribute, TypeAttribute):
 
     name = "cir.float"
 
+    @property
+    def format(self) -> str:
+        return "<f"
+
 
 @irdl_attr_definition
 class DoubleType(ParametrizedAttribute, TypeAttribute):
     """`!cir.double` — CIR double-precision (64-bit) float."""
 
     name = "cir.double"
+
+    @property
+    def format(self) -> str:
+        return "<d"
 
 
 @irdl_attr_definition
@@ -133,12 +144,22 @@ class FP16Type(ParametrizedAttribute, TypeAttribute):
 
     name = "cir.f16"
 
+    @property
+    def format(self) -> str:
+        return "<e"
+
 
 @irdl_attr_definition
 class BF16Type(ParametrizedAttribute, TypeAttribute):
     """`!cir.bf16` — CIR bfloat16 (16-bit) float."""
 
     name = "cir.bf16"
+
+    @property
+    def format(self) -> str:
+        # Python `struct` has no native bfloat16 packing; defer to the
+        # CIRFPAttr printer which handles bf16 directly.
+        raise NotImplementedError()
 
 
 @irdl_attr_definition
@@ -147,12 +168,22 @@ class FP80Type(ParametrizedAttribute, TypeAttribute):
 
     name = "cir.f80"
 
+    @property
+    def format(self) -> str:
+        # Python `struct` has no 80-bit float packing.
+        raise NotImplementedError()
+
 
 @irdl_attr_definition
 class FP128Type(ParametrizedAttribute, TypeAttribute):
     """`!cir.f128` — CIR quad-precision (128-bit) float."""
 
     name = "cir.f128"
+
+    @property
+    def format(self) -> str:
+        # Python `struct` has no 128-bit float packing.
+        raise NotImplementedError()
 
 
 @irdl_attr_definition
@@ -461,12 +492,21 @@ class RecordType(ParametrizedAttribute, TypeAttribute):
             members: list[Attribute] = []
             incomplete = parser.parse_optional_keyword("incomplete") is not None
             if not incomplete:
-                parser.parse_punctuation("{")
-                if parser.parse_optional_punctuation("}") is None:
-                    members.append(parser.parse_type())
-                    while parser.parse_optional_punctuation(",") is not None:
+                # An identified record may appear as a forward reference of
+                # the form `<struct "Name">` (no body, no `incomplete`); treat
+                # this as the incomplete form.
+                if parser.parse_optional_punctuation("{") is None:
+                    if not record_name:
+                        parser.raise_error(
+                            "expected 'incomplete' or '{' for record body"
+                        )
+                    incomplete = True
+                else:
+                    if parser.parse_optional_punctuation("}") is None:
                         members.append(parser.parse_type())
-                    parser.parse_punctuation("}")
+                        while parser.parse_optional_punctuation(",") is not None:
+                            members.append(parser.parse_type())
+                        parser.parse_punctuation("}")
         return [
             ArrayAttr(members),
             StringAttr(record_name),
@@ -568,7 +608,21 @@ class CIRFPAttr(ParametrizedAttribute):
 
     def print_parameters(self, printer: Printer) -> None:
         with printer.in_angle_brackets():
-            printer.print_float(self.value.value.data, self.value.type)
+            value = self.value.value.data
+            # For builtin float types whose `format` is not implemented
+            # (BFloat16Type, Float80Type, Float128Type), Python's `struct`
+            # cannot pack/unpack their representation, so xdsl's
+            # `printer.print_float` round-trip check crashes. Format such
+            # values directly with mlir-opt-style scientific notation.
+            try:
+                _ = self.value.type.format
+                use_native = True
+            except NotImplementedError:
+                use_native = False
+            if use_native:
+                printer.print_float(value, self.value.type)
+            else:
+                printer.print_string(_format_fp_scientific(value))
         printer.print_string(" : ")
         printer.print_attribute(self.fp_type)
 
@@ -596,6 +650,28 @@ class CIRFPAttr(ParametrizedAttribute):
 
     def get_type(self) -> Attribute:
         return self.fp_type
+
+
+def _format_fp_scientific(value: float) -> str:
+    """Format a float in mlir-opt scientific notation (e.g. `1.250000e+00`).
+
+    Used for CIR FP types whose builtin equivalent does not implement the
+    `format` property (BF16, FP80, FP128) — for these, xdsl's
+    `printer.print_float` cannot pack/unpack the value through Python's
+    `struct` module to verify a lossless round-trip.
+    """
+    import math
+
+    if math.isnan(value) or math.isinf(value):
+        return repr(value)
+    s = f"{value:.6e}"
+    # mlir uses two-digit exponents; Python already does on Linux but force it.
+    idx = s.find("e")
+    sign = s[idx + 1]
+    digits = s[idx + 2 :]
+    if len(digits) < 2:
+        digits = digits.zfill(2)
+    return s[:idx] + "e" + sign + digits
 
 
 def _cir_fp_to_builtin(t: Attribute) -> AnyFloat:
@@ -720,29 +796,38 @@ class ConstArrayAttr(ParametrizedAttribute):
                 printer.print_attribute(self.arr_type)
             else:
                 printer.print_attribute(self.elts)
+            if self.trailing_zeros.value.data != 0:
+                printer.print_string(", trailing_zeros")
         # Outer typed-attribute `: T` suffix (TypedAttrInterface).
         printer.print_string(" : ")
         printer.print_attribute(self.arr_type)
 
     @classmethod
     def parse_parameters(cls, parser: AttrParser) -> list[Attribute]:
+        explicit_trailing_zeros = False
         with parser.in_angle_brackets():
             elts = parser.parse_attribute()
             inner_type = None
             # Inner `: T` only present when elts is a string literal.
             if parser.parse_optional_punctuation(":") is not None:
                 inner_type = parser.parse_type()
+            # Optional `, trailing_zeros` modifier.
+            if parser.parse_optional_punctuation(",") is not None:
+                parser.parse_keyword("trailing_zeros")
+                explicit_trailing_zeros = True
         # Outer `: T` typed-attribute suffix.
         parser.parse_punctuation(":")
         outer_type = parser.parse_type()
         arr_type = inner_type if inner_type is not None else outer_type
         zeros = 0
-        if isinstance(arr_type, ArrayType):
+        if explicit_trailing_zeros and isinstance(arr_type, ArrayType):
             if isinstance(elts, StringAttr):
                 zeros = max(0, arr_type.length - len(elts.data))
             elif isinstance(elts, ArrayAttr):
                 arr_elts = cast(ArrayAttr[Attribute], elts)
                 zeros = max(0, arr_type.length - len(arr_elts.data))
+            # If lengths match, still mark as explicitly trailing_zeros via 0.
+            # When the keyword is absent, we keep zeros = 0 regardless.
         return [arr_type, elts, IntegerAttr(zeros, 64)]
 
     def get_type(self) -> Attribute:
@@ -1162,6 +1247,11 @@ class AllocaOp(IRDLOperation):
         ptr_type = parser.parse_type()
         parser.parse_punctuation(",")
         dyn_operands: list[SSAValue] = []
+        # Two legacy forms for the dynamic-size operand:
+        #   1. parenthesised  `(%size : !sizeT), [name...]`
+        #   2. comma-form     `%size : !sizeT, [name...]`
+        # The comma-form matches upstream cir-opt; the parenthesised form is kept
+        # for backwards compatibility with existing IR.
         if parser.parse_optional_punctuation("(") is not None:
             dyn = parser.parse_unresolved_operand()
             parser.parse_punctuation(":")
@@ -1169,6 +1259,13 @@ class AllocaOp(IRDLOperation):
             parser.parse_punctuation(")")
             dyn_operands.append(parser.resolve_operand(dyn, dyn_type))
             parser.parse_punctuation(",")
+        else:
+            dyn = parser.parse_optional_unresolved_operand()
+            if dyn is not None:
+                parser.parse_punctuation(":")
+                dyn_type = parser.parse_type()
+                dyn_operands.append(parser.resolve_operand(dyn, dyn_type))
+                parser.parse_punctuation(",")
         parser.parse_punctuation("[")
         alloc_name_t = parser.parse_optional_str_literal()
         alloc_name = "" if alloc_name_t is None else alloc_name_t
@@ -1207,11 +1304,10 @@ class AllocaOp(IRDLOperation):
         printer.print_attribute(self.addr.type)
         printer.print_string(", ")
         if self.dyn_alloc_size:
-            printer.print_string("(")
             printer.print_operand(self.dyn_alloc_size[0])
             printer.print_string(" : ")
             printer.print_attribute(self.dyn_alloc_size[0].type)
-            printer.print_string("), ")
+            printer.print_string(", ")
         printer.print_string("[")
         printer.print_string_literal(
             self.alloc_name.data if self.alloc_name is not None else ""
@@ -1263,11 +1359,13 @@ class GlobalOp(IRDLOperation):
     comdat = opt_prop_def(UnitAttr)
     annotations = opt_prop_def(ArrayAttr)
     addr_space = opt_prop_def(Attribute, prop_name="addr_space")
-    ctor = opt_prop_def(Attribute)
-    dtor = opt_prop_def(Attribute)
+    has_ctor = opt_prop_def(UnitAttr)
+    has_dtor = opt_prop_def(UnitAttr)
 
-    body = region_def()
     ctor_region = region_def()
+    dtor_region = region_def()
+
+    traits = traits_def(NoTerminator())
 
     @classmethod
     def parse(cls, parser: Parser) -> GlobalOp:
@@ -1282,6 +1380,18 @@ class GlobalOp(IRDLOperation):
                     sym_visibility = StringAttr(kw)
                     break
 
+        # Optional linkage spec as a quoted string (e.g. `"private"`,
+        # `"internal"`). This is distinct from the visibility quoted string
+        # above — visibility is one of "private"/"public"/"nested"; anything
+        # else is treated as a linkage specifier.
+        linkage_str = parser.parse_optional_str_literal()
+        if linkage_str is not None:
+            # If the visibility wasn't set yet and this string actually names
+            # a visibility, treat it as visibility.
+            if sym_visibility is None and linkage_str in ("private", "public", "nested"):
+                sym_visibility = StringAttr(linkage_str)
+                linkage_str = None
+
         constant = (
             UnitAttr()
             if parser.parse_optional_keyword("constant") is not None
@@ -1291,11 +1401,21 @@ class GlobalOp(IRDLOperation):
             UnitAttr() if parser.parse_optional_keyword("comdat") is not None else None
         )
 
-        linkage_val = 0
-        for kw, val in _LINKAGE_KIND.items():
-            if parser.parse_optional_keyword(kw) is not None:
-                linkage_val = val
-                break
+        linkage_val: int | None = None
+        if linkage_str is not None:
+            if linkage_str not in _LINKAGE_KIND:
+                parser.raise_error(
+                    f"unknown linkage specifier {linkage_str!r}; expected one of "
+                    f"{sorted(_LINKAGE_KIND)}"
+                )
+            linkage_val = _LINKAGE_KIND[linkage_str]
+        else:
+            for kw, val in _LINKAGE_KIND.items():
+                if parser.parse_optional_keyword(kw) is not None:
+                    linkage_val = val
+                    break
+        if linkage_val is None:
+            linkage_val = 0  # default to `external`
 
         dso_local = (
             UnitAttr()
@@ -1307,18 +1427,40 @@ class GlobalOp(IRDLOperation):
 
         initial_value: Attribute | None = None
         sym_type: Attribute | None = None
+        has_ctor: UnitAttr | None = None
+        has_dtor: UnitAttr | None = None
+        ctor_region = Region()
+        dtor_region = Region()
         if parser.parse_optional_punctuation("=") is not None:
-            initial_value = parser.parse_attribute()
-            # Some attribute forms carry their own type, others use a `:` suffix.
-            inner_type = _typed_attr_type(initial_value)
-            if parser.parse_optional_punctuation(":") is not None:
+            # `= ctor : <type> { region }` form.
+            if parser.parse_optional_keyword("ctor") is not None:
+                has_ctor = UnitAttr()
+                parser.parse_punctuation(":")
                 sym_type = parser.parse_type()
-            elif inner_type is not None:
-                sym_type = inner_type
+                ctor_region = parser.parse_region()
+                # Optional trailing `dtor { region }`.
+                if parser.parse_optional_keyword("dtor") is not None:
+                    has_dtor = UnitAttr()
+                    dtor_region = parser.parse_region()
             else:
-                parser.raise_error(
-                    "cir.global initial value must carry a type or be followed by `:`"
-                )
+                initial_value = parser.parse_attribute()
+                # Some attribute forms carry their own type, others use a `:` suffix.
+                inner_type = _typed_attr_type(initial_value)
+                if parser.parse_optional_punctuation(":") is not None:
+                    sym_type = parser.parse_type()
+                elif inner_type is not None:
+                    sym_type = inner_type
+                else:
+                    parser.raise_error(
+                        "cir.global initial value must carry a type or be followed by `:`"
+                    )
+                # Optional trailing `dtor { region }`.
+                if parser.parse_optional_keyword("dtor") is not None:
+                    has_dtor = UnitAttr()
+                    dtor_region = parser.parse_region()
+        elif parser.parse_optional_punctuation(":") is not None:
+            # No-init form: `@sym : <type>`.
+            sym_type = parser.parse_type()
 
         attrs = parser.parse_optional_dictionary_attr_dict()
         alignment = attrs.pop("alignment", None)
@@ -1344,11 +1486,13 @@ class GlobalOp(IRDLOperation):
             "dso_local": dso_local,
             "initial_value": initial_value,
             "alignment": alignment,
+            "has_ctor": has_ctor,
+            "has_dtor": has_dtor,
         }
         return cls.create(
             properties=_props(properties),
             attributes=attrs,
-            regions=[Region(), Region()],
+            regions=[ctor_region, dtor_region],
         )
 
     def print(self, printer: Printer) -> None:
@@ -1360,21 +1504,34 @@ class GlobalOp(IRDLOperation):
         if self.comdat is not None:
             printer.print_string(" comdat")
         linkage_val = self.linkage.value.data
-        if linkage_val != 0:
-            kw = _LINKAGE_KIND_INV.get(linkage_val)
-            if kw:
-                printer.print_string(" ")
-                printer.print_string(kw)
+        kw = _LINKAGE_KIND_INV.get(linkage_val)
+        if kw:
+            printer.print_string(" ")
+            printer.print_string(kw)
         if self.dso_local is not None:
             printer.print_string(" dso_local")
         printer.print_string(" ")
         printer.print_symbol_name(self.sym_name.data)
-        if self.initial_value is not None:
+        if self.has_ctor is not None:
+            printer.print_string(" = ctor : ")
+            printer.print_attribute(self.sym_type)
+            printer.print_string(" ")
+            printer.print_region(self.ctor_region)
+            if self.has_dtor is not None:
+                printer.print_string(" dtor ")
+                printer.print_region(self.dtor_region)
+        elif self.initial_value is not None:
             printer.print_string(" = ")
             printer.print_attribute(self.initial_value)
             if _typed_attr_type(self.initial_value) is None:
                 printer.print_string(" : ")
                 printer.print_attribute(self.sym_type)
+            if self.has_dtor is not None:
+                printer.print_string(" dtor ")
+                printer.print_region(self.dtor_region)
+        else:
+            printer.print_string(" : ")
+            printer.print_attribute(self.sym_type)
         rest: dict[str, Attribute] = dict(self.attributes)
         if self.alignment is not None:
             rest["alignment"] = self.alignment
@@ -1627,9 +1784,17 @@ class CallOp(IRDLOperation):
 
     @classmethod
     def parse(cls, parser: Parser) -> CallOp:
-        sym = parser.parse_attribute()
-        if not isinstance(sym, SymbolRefAttr) or sym.nested_references.data:
-            parser.raise_error("expected a flat callee symbol reference")
+        # Two callee forms:
+        #   - direct:   `@symbol`
+        #   - indirect: `%ssa-value`  (the callee is the first operand)
+        sym: SymbolRefAttr | None = None
+        indirect_callee: UnresolvedOperand | None = None
+        indirect_callee = parser.parse_optional_unresolved_operand()
+        if indirect_callee is None:
+            attr = parser.parse_attribute()
+            if not isinstance(attr, SymbolRefAttr) or attr.nested_references.data:
+                parser.raise_error("expected a flat callee symbol reference")
+            sym = attr
         parser.parse_punctuation("(")
         arg_uns: list[UnresolvedOperand] = []
         if parser.parse_optional_punctuation(")") is None:
@@ -1654,11 +1819,11 @@ class CallOp(IRDLOperation):
             side_effect = IntegerAttr({"all": 0, "const": 1, "pure": 2}.get(kw, 0), 32)
         parser.parse_punctuation(":")
         parser.parse_punctuation("(")
-        arg_types: list[Attribute] = []
+        all_types: list[Attribute] = []
         if parser.parse_optional_punctuation(")") is None:
-            arg_types.append(parser.parse_type())
+            all_types.append(parser.parse_type())
             while parser.parse_optional_punctuation(",") is not None:
-                arg_types.append(parser.parse_type())
+                all_types.append(parser.parse_type())
             parser.parse_punctuation(")")
         parser.parse_punctuation("->")
         result_types: list[Attribute] = []
@@ -1670,9 +1835,29 @@ class CallOp(IRDLOperation):
                 parser.parse_punctuation(")")
         else:
             result_types.append(parser.parse_type())
-        if len(arg_types) != len(arg_uns):
-            parser.raise_error("operand and type-list lengths differ for cir.call")
-        operands = [parser.resolve_operand(u, t) for u, t in zip(arg_uns, arg_types)]
+        # For indirect calls, the type list begins with the callee pointer type.
+        if indirect_callee is not None:
+            if not all_types:
+                parser.raise_error(
+                    "indirect cir.call expects callee type as first operand-list type"
+                )
+            callee_type = all_types[0]
+            arg_types = all_types[1:]
+            if len(arg_types) != len(arg_uns):
+                parser.raise_error("operand and type-list lengths differ for cir.call")
+            operands: list[SSAValue] = [
+                parser.resolve_operand(indirect_callee, callee_type)
+            ]
+            operands.extend(
+                parser.resolve_operand(u, t) for u, t in zip(arg_uns, arg_types)
+            )
+        else:
+            arg_types = all_types
+            if len(arg_types) != len(arg_uns):
+                parser.raise_error("operand and type-list lengths differ for cir.call")
+            operands = [
+                parser.resolve_operand(u, t) for u, t in zip(arg_uns, arg_types)
+            ]
         return cls.create(
             operands=operands,
             result_types=result_types,
@@ -1687,16 +1872,28 @@ class CallOp(IRDLOperation):
         )
 
     def print(self, printer: Printer) -> None:
+        # Indirect calls: callee is the first operand and `callee` symbol is unset.
+        # Direct calls:   callee is a `@sym` attribute, all `arg_ops` are real args.
+        printer.print_string(" ")
         if self.callee is not None:
-            printer.print_string(" ")
             printer.print_attribute(self.callee)
+            real_args = list(self.arg_ops)
+        else:
+            assert len(self.arg_ops) >= 1, "indirect cir.call requires callee operand"
+            printer.print_operand(self.arg_ops[0])
+            real_args = list(self.arg_ops[1:])
         printer.print_string("(")
-        printer.print_list(self.arg_ops, printer.print_operand)
+        printer.print_list(real_args, printer.print_operand)
         printer.print_string(")")
         if self.nothrow is not None:
             printer.print_string(" nothrow")
         if self.exception is not None:
             printer.print_string(" exception")
+        if self.side_effect is not None:
+            kw = {0: "all", 1: "const", 2: "pure"}.get(
+                self.side_effect.value.data, "all"
+            )
+            printer.print_string(f" side_effect({kw})")
         printer.print_string(" : (")
         printer.print_list(self.arg_ops, lambda v: printer.print_attribute(v.type))
         printer.print_string(") -> ")
@@ -2725,9 +2922,17 @@ class DoWhileOp(IRDLOperation):
         printer.print_region(self.cond_region)
 
 
+_CASE_KIND_NAME = {0: "default", 1: "equal", 2: "anyof", 3: "range"}
+_CASE_KIND_VALUE = {v: k for k, v in _CASE_KIND_NAME.items()}
+
+
 @irdl_op_definition
 class SwitchOp(IRDLOperation):
-    """`cir.switch` — structured C/C++ switch."""
+    """`cir.switch` — structured C/C++ switch.
+
+    Pretty: `cir.switch` `(` $cond `:` cond-type `)`
+                         (`all_enum_cases_covered`)? `{` body-region `}`
+    """
 
     name = "cir.switch"
 
@@ -2735,10 +2940,44 @@ class SwitchOp(IRDLOperation):
     body = region_def()
     all_enum_cases_covered = opt_prop_def(UnitAttr)
 
+    @classmethod
+    def parse(cls, parser: Parser) -> SwitchOp:
+        parser.parse_punctuation("(")
+        cond_un = parser.parse_unresolved_operand()
+        parser.parse_punctuation(":")
+        cond_type = parser.parse_type()
+        parser.parse_punctuation(")")
+        all_enum = (
+            UnitAttr()
+            if parser.parse_optional_keyword("all_enum_cases_covered") is not None
+            else None
+        )
+        body = parser.parse_region()
+        return cls.create(
+            operands=[parser.resolve_operand(cond_un, cond_type)],
+            regions=[body],
+            properties=_props({"all_enum_cases_covered": all_enum}),
+        )
+
+    def print(self, printer: Printer) -> None:
+        printer.print_string(" (")
+        printer.print_operand(self.condition)
+        printer.print_string(" : ")
+        printer.print_attribute(self.condition.type)
+        printer.print_string(")")
+        if self.all_enum_cases_covered is not None:
+            printer.print_string(" all_enum_cases_covered")
+        printer.print_string(" ")
+        printer.print_region(self.body)
+
 
 @irdl_op_definition
 class CaseOp(IRDLOperation):
-    """`cir.case` — case clause within a `cir.switch`."""
+    """`cir.case` — case clause within a `cir.switch`.
+
+    Pretty: `cir.case` `(` kind `,` `[` (typed-int (`,` typed-int)*)? `]` `)`
+                       `{` region `}`
+    """
 
     name = "cir.case"
 
@@ -2746,10 +2985,52 @@ class CaseOp(IRDLOperation):
     value = prop_def(ArrayAttr)
     kind = prop_def(IntegerAttr)
 
+    @classmethod
+    def parse(cls, parser: Parser) -> CaseOp:
+        parser.parse_punctuation("(")
+        kind_kw = parser.parse_identifier()
+        if kind_kw not in _CASE_KIND_VALUE:
+            parser.raise_error(
+                f"expected one of {sorted(_CASE_KIND_VALUE)}, got '{kind_kw}'"
+            )
+        parser.parse_punctuation(",")
+        parser.parse_punctuation("[")
+        values: list[Attribute] = []
+        if parser.parse_optional_punctuation("]") is None:
+            values.append(parser.parse_attribute())
+            while parser.parse_optional_punctuation(",") is not None:
+                values.append(parser.parse_attribute())
+            parser.parse_punctuation("]")
+        parser.parse_punctuation(")")
+        region = parser.parse_region()
+        return cls.create(
+            regions=[region],
+            properties={
+                "value": ArrayAttr(values),
+                "kind": IntegerAttr(_CASE_KIND_VALUE[kind_kw], 32),
+            },
+        )
+
+    def print(self, printer: Printer) -> None:
+        printer.print_string(" (")
+        printer.print_string(
+            _CASE_KIND_NAME.get(self.kind.value.data, str(self.kind.value.data))
+        )
+        printer.print_string(", [")
+        printer.print_list(self.value.data, printer.print_attribute)
+        printer.print_string("]) ")
+        printer.print_region(self.case_region)
+
 
 @irdl_op_definition
 class SwitchFlatOp(IRDLOperation):
-    """`cir.switch.flat` — region-less, LLVM-style switch terminator."""
+    """`cir.switch.flat` — region-less, LLVM-style switch terminator.
+
+    Pretty: `cir.switch.flat` $cond `:` cond-type `,` ^default
+                              (`(` $defaultOperands `:` types `)`)?
+                              `[` (case (`,` case)*)? `]`
+    where case ::= integer `:` ^bb (`(` operands `:` types `)`)?
+    """
 
     name = "cir.switch.flat"
 
@@ -2757,22 +3038,200 @@ class SwitchFlatOp(IRDLOperation):
     default_operands = var_operand_def()
     case_operands = var_operand_def()
     case_values = prop_def(ArrayAttr)
-    case_operand_segments = prop_def(Attribute)
+    case_operand_segments = prop_def(DenseArrayBase)
     successor = var_successor_def()
     traits = traits_def(IsTerminator())
 
     irdl_options = [AttrSizedOperandSegments()]
 
+    @classmethod
+    def parse(cls, parser: Parser) -> SwitchFlatOp:
+        cond_un = parser.parse_unresolved_operand()
+        parser.parse_punctuation(":")
+        cond_type = parser.parse_type()
+        if not isinstance(cond_type, IntType):
+            parser.raise_error("cir.switch.flat condition must be a !cir.int")
+        parser.parse_punctuation(",")
+        default_block = parser.parse_successor()
+        default_operands: list[SSAValue] = []
+        if parser.parse_optional_punctuation("(") is not None:
+            d_uns = [parser.parse_unresolved_operand()]
+            while parser.parse_optional_punctuation(",") is not None:
+                d_uns.append(parser.parse_unresolved_operand())
+            parser.parse_punctuation(":")
+            d_types = [parser.parse_type()]
+            while parser.parse_optional_punctuation(",") is not None:
+                d_types.append(parser.parse_type())
+            parser.parse_punctuation(")")
+            if len(d_uns) != len(d_types):
+                parser.raise_error("default operand count and type count must match")
+            default_operands = [
+                parser.resolve_operand(u, t) for u, t in zip(d_uns, d_types)
+            ]
+
+        parser.parse_punctuation("[")
+        case_values: list[Attribute] = []
+        case_blocks: list[Block] = []
+        case_operands: list[SSAValue] = []
+        case_segments: list[int] = []
+
+        if parser.parse_optional_punctuation("]") is None:
+
+            def parse_one_case() -> None:
+                int_val = parser.parse_integer(allow_negative=True)
+                parser.parse_punctuation(":")
+                blk = parser.parse_successor()
+                seg = 0
+                if parser.parse_optional_punctuation("(") is not None:
+                    uns = [parser.parse_unresolved_operand()]
+                    while parser.parse_optional_punctuation(",") is not None:
+                        uns.append(parser.parse_unresolved_operand())
+                    parser.parse_punctuation(":")
+                    types = [parser.parse_type()]
+                    while parser.parse_optional_punctuation(",") is not None:
+                        types.append(parser.parse_type())
+                    parser.parse_punctuation(")")
+                    if len(uns) != len(types):
+                        parser.raise_error(
+                            "case operand count and type count must match"
+                        )
+                    for u, t in zip(uns, types):
+                        case_operands.append(parser.resolve_operand(u, t))
+                    seg = len(uns)
+                case_values.append(CIRIntAttr(int_val, cond_type))
+                case_blocks.append(blk)
+                case_segments.append(seg)
+
+            parse_one_case()
+            while parser.parse_optional_punctuation(",") is not None:
+                parse_one_case()
+            parser.parse_punctuation("]")
+
+        return cls.build(
+            operands=[
+                parser.resolve_operand(cond_un, cond_type),
+                default_operands,
+                case_operands,
+            ],
+            successors=[[default_block, *case_blocks]],
+            properties={
+                "case_values": ArrayAttr(case_values),
+                "case_operand_segments": DenseArrayBase.from_list(
+                    i32, case_segments
+                ),
+            },
+        )
+
+    def print(self, printer: Printer) -> None:
+        printer.print_string(" ")
+        printer.print_operand(self.condition)
+        printer.print_string(" : ")
+        printer.print_attribute(self.condition.type)
+        printer.print_string(", ")
+        printer.print_block_name(self.successor[0])
+        if self.default_operands:
+            printer.print_string("(")
+            printer.print_list(self.default_operands, printer.print_operand)
+            printer.print_string(" : ")
+            printer.print_list(
+                self.default_operands,
+                lambda v: printer.print_attribute(v.type),
+            )
+            printer.print_string(")")
+        printer.print_string(" [")
+        case_blocks = list(self.successor)[1:]
+        case_values = list(self.case_values.data)
+        seg_attr = cast(DenseArrayBase[IntegerType], self.case_operand_segments)
+        segments = [int(x) for x in seg_attr.iter_values()]
+        operands = list(self.case_operands)
+        op_idx = 0
+        if case_blocks:
+            printer.print_string("\n")
+        for i, (val, blk, seg) in enumerate(
+            zip(case_values, case_blocks, segments)
+        ):
+            if i > 0:
+                printer.print_string(",\n")
+            printer.print_string("  ")
+            if isinstance(val, CIRIntAttr):
+                v = val.value.value.data
+                if val.int_type.signed:
+                    width = val.int_type.bitwidth
+                    if v >= (1 << (width - 1)):
+                        v -= 1 << width
+                printer.print_string(str(v))
+            else:
+                printer.print_attribute(val)
+            printer.print_string(": ")
+            printer.print_block_name(blk)
+            if seg:
+                printer.print_string("(")
+                segment_ops = operands[op_idx : op_idx + seg]
+                printer.print_list(segment_ops, printer.print_operand)
+                printer.print_string(" : ")
+                printer.print_list(
+                    segment_ops, lambda v: printer.print_attribute(v.type)
+                )
+                printer.print_string(")")
+            op_idx += seg
+        if case_blocks:
+            printer.print_string("\n")
+        printer.print_string("]")
+
 
 @irdl_op_definition
 class CopyOp(IRDLOperation):
-    """`cir.copy` — typed pointer-to-pointer memcpy."""
+    """`cir.copy` — typed pointer-to-pointer memcpy.
+
+    Pretty: `cir.copy` $src `to` $dst (`volatile`)? attr-dict `:` ptr-type
+    """
 
     name = "cir.copy"
 
     dst = operand_def(PointerType)
     src = operand_def(PointerType)
     is_volatile = opt_prop_def(UnitAttr)
+    tbaa = opt_prop_def(Attribute)
+
+    @classmethod
+    def parse(cls, parser: Parser) -> CopyOp:
+        src_un = parser.parse_unresolved_operand()
+        parser.parse_keyword("to")
+        dst_un = parser.parse_unresolved_operand()
+        is_volatile = (
+            UnitAttr()
+            if parser.parse_optional_keyword("volatile") is not None
+            else None
+        )
+        attrs = parser.parse_optional_dictionary_attr_dict()
+        tbaa = attrs.pop("tbaa", None)
+        parser.parse_punctuation(":")
+        ptr_type = parser.parse_type()
+        return cls.create(
+            operands=[
+                parser.resolve_operand(dst_un, ptr_type),
+                parser.resolve_operand(src_un, ptr_type),
+            ],
+            properties=_props(
+                {
+                    "is_volatile": is_volatile,
+                    "tbaa": tbaa,
+                }
+            ),
+        )
+
+    def print(self, printer: Printer) -> None:
+        printer.print_string(" ")
+        printer.print_operand(self.src)
+        printer.print_string(" to ")
+        printer.print_operand(self.dst)
+        if self.is_volatile is not None:
+            printer.print_string(" volatile")
+        if self.tbaa is not None:
+            printer.print_string(" ")
+            printer.print_attr_dict({"tbaa": self.tbaa})
+        printer.print_string(" : ")
+        printer.print_attribute(self.dst.type)
 
 
 @irdl_op_definition
@@ -2867,7 +3326,11 @@ class IsConstantOp(IRDLOperation):
 
 @irdl_op_definition
 class ObjSizeOp(IRDLOperation):
-    """`cir.objsize` — `__builtin_object_size`."""
+    """`cir.objsize` — `__builtin_object_size`.
+
+    Pretty: `cir.objsize` (`min` | `max`) (`nullunknown`)? (`dynamic`)?
+                          $ptr `:` ptr-type `->` int-type
+    """
 
     name = "cir.objsize"
 
@@ -2876,6 +3339,54 @@ class ObjSizeOp(IRDLOperation):
     min = opt_prop_def(UnitAttr)
     nullunknown = opt_prop_def(UnitAttr)
     dynamic = opt_prop_def(UnitAttr)
+
+    @classmethod
+    def parse(cls, parser: Parser) -> ObjSizeOp:
+        kw = parser.parse_identifier()
+        if kw == "min":
+            min_attr: UnitAttr | None = UnitAttr()
+        elif kw == "max":
+            min_attr = None
+        else:
+            parser.raise_error(f"expected 'min' or 'max' but got '{kw}'")
+        nullunknown = (
+            UnitAttr()
+            if parser.parse_optional_keyword("nullunknown") is not None
+            else None
+        )
+        dynamic = (
+            UnitAttr() if parser.parse_optional_keyword("dynamic") is not None else None
+        )
+        ptr_un = parser.parse_unresolved_operand()
+        parser.parse_punctuation(":")
+        ptr_type = parser.parse_type()
+        parser.parse_punctuation("->")
+        res_type = parser.parse_type()
+        return cls.create(
+            operands=[parser.resolve_operand(ptr_un, ptr_type)],
+            result_types=[res_type],
+            properties=_props(
+                {
+                    "min": min_attr,
+                    "nullunknown": nullunknown,
+                    "dynamic": dynamic,
+                }
+            ),
+        )
+
+    def print(self, printer: Printer) -> None:
+        printer.print_string(" ")
+        printer.print_string("min" if self.min is not None else "max")
+        if self.nullunknown is not None:
+            printer.print_string(" nullunknown")
+        if self.dynamic is not None:
+            printer.print_string(" dynamic")
+        printer.print_string(" ")
+        printer.print_operand(self.ptr)
+        printer.print_string(" : ")
+        printer.print_attribute(self.ptr.type)
+        printer.print_string(" -> ")
+        printer.print_attribute(self.res.type)
 
 
 @irdl_op_definition
@@ -2913,20 +3424,49 @@ class PrefetchOp(IRDLOperation):
 
 @irdl_op_definition
 class StackSaveOp(IRDLOperation):
-    """`cir.stacksave` — VLA stack snapshot."""
+    """`cir.stacksave` — VLA stack snapshot.
+
+    Pretty: `cir.stacksave` `:` ptr-type
+    """
 
     name = "cir.stacksave"
 
     res = result_def(PointerType)
 
+    @classmethod
+    def parse(cls, parser: Parser) -> StackSaveOp:
+        parser.parse_punctuation(":")
+        res_type = parser.parse_type()
+        return cls.create(result_types=[res_type])
+
+    def print(self, printer: Printer) -> None:
+        printer.print_string(" : ")
+        printer.print_attribute(self.res.type)
+
 
 @irdl_op_definition
 class StackRestoreOp(IRDLOperation):
-    """`cir.stackrestore` — restore stack to a previously-saved snapshot."""
+    """`cir.stackrestore` — restore stack to a previously-saved snapshot.
+
+    Pretty: `cir.stackrestore` $ptr `:` ptr-type
+    """
 
     name = "cir.stackrestore"
 
     ptr = operand_def(PointerType)
+
+    @classmethod
+    def parse(cls, parser: Parser) -> StackRestoreOp:
+        ptr_un = parser.parse_unresolved_operand()
+        parser.parse_punctuation(":")
+        ptr_type = parser.parse_type()
+        return cls.create(operands=[parser.resolve_operand(ptr_un, ptr_type)])
+
+    def print(self, printer: Printer) -> None:
+        printer.print_string(" ")
+        printer.print_operand(self.ptr)
+        printer.print_string(" : ")
+        printer.print_attribute(self.ptr.type)
 
 
 @irdl_op_definition
