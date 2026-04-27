@@ -22,9 +22,9 @@ from typing import cast
 from xdsl.dialects.builtin import (
     AnyFloat,
     ArrayAttr,
+    FlatSymbolRefAttr,
     Float32Type,
     Float64Type,
-    FlatSymbolRefAttr,
     FloatAttr,
     IntegerAttr,
     IntegerType,
@@ -56,7 +56,6 @@ from xdsl.irdl import (
 from xdsl.parser import AttrParser
 from xdsl.printer import Printer
 from xdsl.traits import IsTerminator
-
 
 # ---------------------------------------------------------------------------
 # Types
@@ -215,9 +214,7 @@ class VectorType(ParametrizedAttribute, TypeAttribute):
     size: IntegerAttr
     is_scalable: IntegerAttr
 
-    def __init__(
-        self, element_type: Attribute, size: int, is_scalable: bool = False
-    ):
+    def __init__(self, element_type: Attribute, size: int, is_scalable: bool = False):
         super().__init__(
             element_type,
             IntegerAttr(size, 64),
@@ -343,9 +340,7 @@ class FuncType(ParametrizedAttribute, TypeAttribute):
             inputs = ArrayAttr(inputs)
         if return_type is None:
             return_type = VoidType()
-        super().__init__(
-            inputs, return_type, IntegerAttr(1 if is_var_arg else 0, 1)
-        )
+        super().__init__(inputs, return_type, IntegerAttr(1 if is_var_arg else 0, 1))
 
     @property
     def has_void_return(self) -> bool:
