@@ -9,36 +9,13 @@ static void swap(float **swp1, float **swp2) {
   *swp2 = t;
 }
 
-static void modify_array_ptr_one(float *a, int idx, float value) {
-  a[idx - 1] = value;
+static void modify_array_one(float *a, int idx, float value) {
+  a[idx] = value;
 }
 
-static void modify_array_one(int n, float *a, int idx, float value) {
-  (void)n;
-  a[idx - 1] = value;
-}
-
-static void modify_array_two(int n, float *a, int idx, float value) {
-  (void)n;
-  a[idx - 1] = value;
-}
-
-static void modify_3darray_ptr_one(int n1, int n2, int n3, int *arr,
-                                   int k, int j, int i, int value) {
-  (void)n1;
-  arr[(i - 1) * n2 * n3 + (j - 1) * n3 + (k - 1)] = value;
-}
-
-static void modify_3darray_one(int n1, int n2, int n3, int *arr,
+static void modify_3darray_one(int n2, int n3, int *arr,
                                int k, int j, int i, int value) {
-  (void)n1;
-  arr[(i - 1) * n2 * n3 + (j - 1) * n3 + (k - 1)] = value;
-}
-
-static void modify_3darray_two(int n1, int n2, int n3, int *arr,
-                               int k, int j, int i, int value) {
-  (void)n1;
-  arr[(i - 1) * n2 * n3 + (j - 1) * n3 + (k - 1)] = value;
+  arr[i * n2 * n3 + j * n3 + k] = value;
 }
 
 static void calc(void) {
@@ -109,13 +86,13 @@ static void calc(void) {
   t = ptr1[2];
   ASSERT(t == (float)(100 - 3));
 
-  modify_array_ptr_one(ptr1, 20, 3.1f);
+  modify_array_one(ptr1, 19, 3.1f);
   ASSERT(ptr1[19] == 3.1f);
 
-  modify_array_one(100, ptr1, 19, 87.64f);
+  modify_array_one(ptr1, 18, 87.64f);
   ASSERT(ptr1[18] == 87.64f);
 
-  modify_array_two(100, ptr1, 76, 992.32f);
+  modify_array_one(ptr1, 75, 992.32f);
   ASSERT(ptr1[75] == 992.32f);
 
   for (int i = 0; i < 15; i++)
@@ -127,13 +104,13 @@ static void calc(void) {
   ASSERT(ptr_md[(5 - 1) * 5 * 10 + (4 - 1) * 10 + (3 - 1)] == 543);
   ASSERT(ptr_md[(15 - 1) * 5 * 10 + (5 - 1) * 10 + (8 - 1)] == 1558);
 
-  modify_3darray_ptr_one(15, 5, 10, ptr_md, 2, 3, 4, 100);
+  modify_3darray_one(5, 10, ptr_md, 1, 2, 3, 100);
   ASSERT(ptr_md[3 * 5 * 10 + 2 * 10 + 1] == 100);
 
-  modify_3darray_one(15, 5, 10, ptr_md, 4, 4, 7, 87);
+  modify_3darray_one(5, 10, ptr_md, 3, 3, 6, 87);
   ASSERT(ptr_md[6 * 5 * 10 + 3 * 10 + 3] == 87);
 
-  modify_3darray_two(15, 5, 10, ptr_md, 7, 1, 3, 13);
+  modify_3darray_one(5, 10, ptr_md, 6, 0, 2, 13);
   ASSERT(ptr_md[2 * 5 * 10 + 0 * 10 + 6] == 13);
 
   free(a);

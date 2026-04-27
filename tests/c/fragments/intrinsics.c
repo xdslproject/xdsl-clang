@@ -32,9 +32,7 @@ static void test_transpose(void) {
 }
 
 static void compute_matmul(int rows, int inner, int cols,
-                           int n1, int n2, int n3,
                            float *a, float *b, float *c) {
-  (void)n1; (void)n2; (void)n3;
   for (int i = 0; i < rows; i++) {
     for (int j = 0; j < cols; j++) {
       float s = 0.0f;
@@ -64,7 +62,7 @@ static void test_matmul(void) {
       b[i * 5 + j] = (float)(i + 1);
     }
   }
-  compute_matmul(5, 5, 5, 0, 0, 0, a, b, c);
+  compute_matmul(5, 5, 5, a, b, c);
   compare_matmul(5, 5, 5, a, b, c);
 
   float *d = malloc(10 * 10 * sizeof(float));
@@ -76,7 +74,7 @@ static void test_matmul(void) {
       e[i * 10 + j] = (float)(i + 1);
     }
   }
-  compute_matmul(10, 10, 10, 0, 0, 0, d, e, f);
+  compute_matmul(10, 10, 10, d, e, f);
   compare_matmul(10, 10, 10, d, e, f);
   free(d);
   free(e);
@@ -151,12 +149,10 @@ static void test_product(void) {
   float stack_data[5 * 10];
   float out_stack_one[10];
   float out_stack_two[5];
-  float out_stack_three;
 
   long long *heap_data = malloc(5 * 10 * sizeof(long long));
   long long *out_heap_one = calloc(10, sizeof(long long));
   long long *out_heap_two = calloc(5, sizeof(long long));
-  long long out_heap_three;
 
   for (int i = 0; i < 5; i++) {
     for (int j = 0; j < 10; j++) {
@@ -186,17 +182,6 @@ static void test_product(void) {
     out_stack_two[i] = pf;
     out_heap_two[i] = pi;
   }
-
-  out_stack_three = 1.0f;
-  out_heap_three = 1;
-  for (int i = 0; i < 5; i++) {
-    for (int j = 0; j < 10; j++) {
-      out_stack_three *= stack_data[i * 10 + j];
-      out_heap_three *= heap_data[i * 10 + j];
-    }
-  }
-  (void)out_stack_three;
-  (void)out_heap_three;
 
   for (int j = 0; j < 10; j++) {
     if (j < 5) {

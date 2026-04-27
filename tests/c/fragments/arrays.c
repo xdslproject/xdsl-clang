@@ -3,26 +3,13 @@
 
 static float global_array[100];
 
-static void modify_array_one(int n, float *a, int idx, float value) {
-  (void)n;
-  a[idx - 1] = value;
+static void modify_array_one(float *a, int idx, float value) {
+  a[idx] = value;
 }
 
-static void modify_array_two(int n, float *a, int idx, float value) {
-  (void)n;
-  a[idx - 1] = value;
-}
-
-static void modify_3darray_one(int n1, int n2, int n3, int *arr,
+static void modify_3darray_one(int n2, int n3, int *arr,
                                int k, int j, int i, int value) {
-  (void)n1;
-  arr[(i - 1) * n2 * n3 + (j - 1) * n3 + (k - 1)] = value;
-}
-
-static void modify_3darray_two(int n1, int n2, int n3, int *arr,
-                               int k, int j, int i, int value) {
-  (void)n1;
-  arr[(i - 1) * n2 * n3 + (j - 1) * n3 + (k - 1)] = value;
+  arr[i * n2 * n3 + j * n3 + k] = value;
 }
 
 static void calc(void) {
@@ -67,16 +54,16 @@ static void calc(void) {
   ASSERT(b[49] == 165.2f);
   ASSERT(global_array[69] == 23.1f);
 
-  modify_array_one(100, a, 20, 20.0f);
-  modify_array_two(100, b, 50, 50.0f);
-  modify_array_two(100, global_array, 70, 700.0f);
+  modify_array_one(a, 19, 20.0f);
+  modify_array_one(b, 49, 50.0f);
+  modify_array_one(global_array, 69, 700.0f);
   for (i = 0; i < 100; i++) {
     ASSERT(a[i] == (float)(i + 1));
     ASSERT(b[i] == (float)(99 - i));
     ASSERT(global_array[i] == (float)((i + 1) * 10));
   }
 
-  modify_array_one(100, global_array, 60, 123.4f);
+  modify_array_one(global_array, 59, 123.4f);
   ASSERT(global_array[59] == 123.4f);
   global_array[59] = 600.0f;
 
@@ -95,10 +82,10 @@ static void calc(void) {
   ASSERT(c[(5 - 1) * 5 * 10 + (4 - 1) * 10 + (3 - 1)] == 543);
   ASSERT(c[(15 - 1) * 5 * 10 + (5 - 1) * 10 + (8 - 1)] == 1558);
 
-  modify_3darray_one(15, 5, 10, c, 2, 3, 4, 100);
-  ASSERT(c[(4 - 1) * 5 * 10 + (3 - 1) * 10 + (2 - 1)] == 100);
-  modify_3darray_two(15, 5, 10, c, 6, 2, 12, 200);
-  ASSERT(c[(12 - 1) * 5 * 10 + (2 - 1) * 10 + (6 - 1)] == 200);
+  modify_3darray_one(5, 10, c, 1, 2, 3, 100);
+  ASSERT(c[3 * 5 * 10 + 2 * 10 + 1] == 100);
+  modify_3darray_one(5, 10, c, 5, 1, 11, 200);
+  ASSERT(c[11 * 5 * 10 + 1 * 10 + 5] == 200);
 }
 
 int main(void) {
