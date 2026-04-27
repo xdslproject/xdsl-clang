@@ -1388,7 +1388,11 @@ class GlobalOp(IRDLOperation):
         if linkage_str is not None:
             # If the visibility wasn't set yet and this string actually names
             # a visibility, treat it as visibility.
-            if sym_visibility is None and linkage_str in ("private", "public", "nested"):
+            if sym_visibility is None and linkage_str in (
+                "private",
+                "public",
+                "nested",
+            ):
                 sym_visibility = StringAttr(linkage_str)
                 linkage_str = None
 
@@ -1452,7 +1456,8 @@ class GlobalOp(IRDLOperation):
                     sym_type = inner_type
                 else:
                     parser.raise_error(
-                        "cir.global initial value must carry a type or be followed by `:`"
+                        "cir.global initial value must carry a type or "
+                        "be followed by `:`"
                     )
                 # Optional trailing `dtor { region }`.
                 if parser.parse_optional_keyword("dtor") is not None:
@@ -3116,9 +3121,7 @@ class SwitchFlatOp(IRDLOperation):
             successors=[[default_block, *case_blocks]],
             properties={
                 "case_values": ArrayAttr(case_values),
-                "case_operand_segments": DenseArrayBase.from_list(
-                    i32, case_segments
-                ),
+                "case_operand_segments": DenseArrayBase.from_list(i32, case_segments),
             },
         )
 
@@ -3147,9 +3150,7 @@ class SwitchFlatOp(IRDLOperation):
         op_idx = 0
         if case_blocks:
             printer.print_string("\n")
-        for i, (val, blk, seg) in enumerate(
-            zip(case_values, case_blocks, segments)
-        ):
+        for i, (val, blk, seg) in enumerate(zip(case_values, case_blocks, segments)):
             if i > 0:
                 printer.print_string(",\n")
             printer.print_string("  ")
