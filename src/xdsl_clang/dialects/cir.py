@@ -395,7 +395,8 @@ class FuncType(ParametrizedAttribute, TypeAttribute):
 
 @irdl_attr_definition
 class RecordType(ParametrizedAttribute, TypeAttribute):
-    """`!cir.record<struct|union|class "name"? (packed)? (padded)? (incomplete | { members })>`.
+    """`!cir.record<struct|union|class "name"? (packed)?
+                                    (padded)? (incomplete | { members })>`.
 
     The fixtures only exercise complete identified records, so mutability /
     self-reference is not modelled here.
