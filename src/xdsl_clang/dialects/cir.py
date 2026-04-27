@@ -17,6 +17,7 @@ attributes appear as plain `i32` integer attributes (e.g.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import cast
 
 from xdsl.dialects.builtin import (
     AnyFloat,
@@ -25,22 +26,16 @@ from xdsl.dialects.builtin import (
     Float64Type,
     FlatSymbolRefAttr,
     FloatAttr,
-    FloatData,
     IntegerAttr,
     IntegerType,
     StringAttr,
     SymbolRefAttr,
-    TypedAttribute,
     UnitAttr,
-    i32,
-    i64,
 )
 from xdsl.ir import (
     Attribute,
     Dialect,
     ParametrizedAttribute,
-    Region,
-    SSAValue,
     TypeAttribute,
 )
 from xdsl.irdl import (
@@ -748,7 +743,8 @@ class ConstArrayAttr(ParametrizedAttribute):
             if isinstance(elts, StringAttr):
                 zeros = max(0, arr_type.length - len(elts.data))
             elif isinstance(elts, ArrayAttr):
-                zeros = max(0, arr_type.length - len(elts.data))
+                arr_elts = cast(ArrayAttr[Attribute], elts)
+                zeros = max(0, arr_type.length - len(arr_elts.data))
         return [arr_type, elts, IntegerAttr(zeros, 64)]
 
     def get_type(self) -> Attribute:
@@ -1374,7 +1370,7 @@ class BrCondOp(IRDLOperation):
     cond = operand_def(BoolType)
     dest_operands_true = var_operand_def()
     dest_operands_false = var_operand_def()
-    successors = var_successor_def()
+    successor = var_successor_def()
     traits = traits_def(IsTerminator())
 
     irdl_options = [AttrSizedOperandSegments()]
@@ -1423,7 +1419,7 @@ class SwitchFlatOp(IRDLOperation):
     case_operands = var_operand_def()
     case_values = prop_def(ArrayAttr)
     case_operand_segments = prop_def(Attribute)
-    successors = var_successor_def()
+    successor = var_successor_def()
     traits = traits_def(IsTerminator())
 
     irdl_options = [AttrSizedOperandSegments()]
