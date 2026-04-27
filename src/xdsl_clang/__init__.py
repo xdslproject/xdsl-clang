@@ -1,3 +1,8 @@
+from xdsl_clang._cir_compat import install as _install_cir_compat
+
+_install_cir_compat()
+
+
 class LazyVersion:
     """
     Resolving the version dynamically is slow, hence this lazy wrapper to get the
