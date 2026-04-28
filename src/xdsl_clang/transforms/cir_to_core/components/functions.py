@@ -57,6 +57,15 @@ def _convert_func_signature(
     return inputs, results
 
 
+def _has_break_or_continue_anywhere(op: cir.FuncOp) -> bool:
+    """True iff the function body contains a `cir.break` or `cir.continue`
+    at any nesting depth — the trigger for unstructured emission (Task 5.7)."""
+    for inner in op.walk():
+        if isa(inner, cir.BreakOp) or isa(inner, cir.ContinueOp):
+            return True
+    return False
+
+
 def translate_function(
     program_state: ProgramState, ctx: SSAValueCtx, op: cir.FuncOp
 ) -> Operation | None:
@@ -67,16 +76,28 @@ def translate_function(
         return None
 
     is_extern = len(op.body.blocks) == 0
+    is_var_arg = bool(op.function_type.varargs)
     inputs, results = _convert_func_signature(
         op.function_type, program_state, is_extern=is_extern
     )
     fn_type = FunctionType.from_lists(inputs, results)
 
     if is_extern:
-        # External declaration → `func.func` with empty region and `private`
-        # visibility (xdsl's `FuncOp.external` builder does this). Pointer
-        # args on extern decls are `!llvm.ptr` to match the plain C ABI;
-        # call sites bridge from memref descriptors at the boundary.
+        # External declaration. Pointer args on extern decls are `!llvm.ptr`
+        # to match the plain C ABI; call sites bridge from memref descriptors
+        # at the boundary.
+        if is_var_arg:
+            # Variadic externs (e.g. `printf(const char*, ...)`) can't be
+            # modelled with `func.func` because the `func` dialect has no
+            # variadic concept. Emit an `llvm.func` declaration so call
+            # sites can use `llvm.call` with a per-call var-callee-type.
+            ret_for_llvm = results[0] if results else llvm.LLVMVoidType()
+            llvm_fty = llvm.LLVMFunctionType(inputs, ret_for_llvm, True)
+            return llvm.FuncOp(
+                sym,
+                llvm_fty,
+                linkage=llvm.LinkageAttr("external"),
+            )
         return func.FuncOp.external(sym, inputs, results)
 
     program_state.enterFunction(sym)
@@ -104,20 +125,36 @@ def translate_function(
 
     # Now translate ops; we need block_map visible to control-flow
     # handlers, so park it on `program_state` for the duration.
-    program_state.getCurrentFnState()
+    fn_state = program_state.getCurrentFnState()
     setattr(program_state, "_block_map", block_map)
+    fn_state.function_region = new_region
+    fn_state.is_unstructured = _has_break_or_continue_anywhere(op)
     try:
         from xdsl_clang.transforms.cir_to_core import statements
 
         for old_block in op.body.blocks:
-            new_block = block_map[old_block]
+            fn_state.current_block = block_map[old_block]
+            fn_state.block_terminated = False
             for body_op in list(old_block.ops):
+                # In unstructured mode a prior handler may have emitted a
+                # terminator (cf.br / cf.cond_br / func.return) into the
+                # current block. Any remaining CIR ops in this source block
+                # are dead — typically a trailing `cir.yield`. Drop them.
+                if fn_state.is_unstructured and fn_state.block_terminated:
+                    continue
                 for new_op in statements.translate_stmt(
                     program_state, fn_ctx, body_op
                 ):
-                    new_block.add_op(new_op)
+                    if fn_state.current_block is None:
+                        raise RuntimeError(
+                            "cir-to-core: current_block became None during "
+                            "function translation"
+                        )
+                    fn_state.current_block.add_op(new_op)
     finally:
         delattr(program_state, "_block_map")
+        fn_state.function_region = None
+        fn_state.current_block = None
         program_state.leaveFunction()
 
     visibility = "private" if op.sym_visibility is not None and op.sym_visibility.data == "private" else None
@@ -174,6 +211,10 @@ def translate_call(
             f"cir-to-core: call to unknown function {callee_sym!r}"
         )
     is_extern_callee = fn_def.is_definition_only
+    # Variadic externs are declared as `llvm.func`; their call sites must
+    # use `llvm.call` so the trailing variadic args don't trip the func
+    # verifier's strict arity check.
+    is_variadic_callee = is_extern_callee and fn_def.is_var_arg
 
     pre_ops: list[Operation] = []
     args: list[SSAValue] = []
@@ -199,6 +240,24 @@ def translate_call(
         result_types.append(
             convert_cir_type_to_standard(fn_def.return_type, program_state)
         )
+
+    if is_variadic_callee:
+        # For variadic externs, count the variadic-tail by subtracting the
+        # number of fixed parameters declared on the callee. The fixed-arg
+        # count is the length of the declared formal-args list.
+        n_fixed = len(fn_def.args)
+        n_variadic = max(0, len(args) - n_fixed)
+        ret_for_call = result_types[0] if result_types else None
+        new_call = llvm.CallOp(
+            callee_sym,
+            *args,
+            return_type=ret_for_call,
+            variadic_args=n_variadic,
+        )
+        if result_types:
+            ctx[op.results[0]] = new_call.results[0]
+        return [*pre_ops, new_call]
+
     new_call = func.CallOp(callee_sym, args, result_types)
     if result_types:
         ctx[op.results[0]] = new_call.results[0]

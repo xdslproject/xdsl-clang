@@ -44,16 +44,33 @@ def _translate_region_into_block(
 
     `skip_terminator` drops `cir.yield` / `cir.condition` (they're handled
     by the surrounding structured-cf op).
+
+    In unstructured-function mode the cursor (`current_block`) is also
+    pinned to `target_block` for the duration so any descendant handler
+    that consults it splices into the same destination.
     """
     from xdsl_clang.transforms.cir_to_core import statements
 
-    for old_op in list(region.block.ops):
-        if skip_terminator and (
-            isa(old_op, cir.YieldOp) or isa(old_op, cir.ConditionOp)
-        ):
-            continue
-        for new_op in statements.translate_stmt(program_state, ctx, old_op):
-            target_block.add_op(new_op)
+    fn_state = program_state.function_state
+    saved_current_block = None
+    saved_block_terminated = False
+    if fn_state is not None:
+        saved_current_block = fn_state.current_block
+        saved_block_terminated = fn_state.block_terminated
+        fn_state.current_block = target_block
+        fn_state.block_terminated = False
+    try:
+        for old_op in list(region.block.ops):
+            if skip_terminator and (
+                isa(old_op, cir.YieldOp) or isa(old_op, cir.ConditionOp)
+            ):
+                continue
+            for new_op in statements.translate_stmt(program_state, ctx, old_op):
+                target_block.add_op(new_op)
+    finally:
+        if fn_state is not None:
+            fn_state.current_block = saved_current_block
+            fn_state.block_terminated = saved_block_terminated
 
 
 def _has_break_or_continue(region: Region) -> bool:
@@ -84,10 +101,21 @@ def _yielded_values(region: Region, ctx: SSAValueCtx) -> list[SSAValue]:
 def translate_if(
     program_state: ProgramState, ctx: SSAValueCtx, op: cir.IfOp
 ) -> list[Operation]:
-    if _has_break_or_continue(op.then_region) or _has_break_or_continue(op.else_region):
-        raise NotImplementedError(
-            "cir-to-core: cir.if containing break/continue (Phase 5)"
-        )
+    fn_state = program_state.function_state
+    has_bc = _has_break_or_continue(op.then_region) or _has_break_or_continue(
+        op.else_region
+    )
+    if has_bc:
+        # Lower to a `cf.cond_br` block-graph diamond. The function-level
+        # scan in `translate_function` already flagged this function as
+        # `is_unstructured` because some descendant has break/continue.
+        if fn_state is None or not fn_state.is_unstructured:
+            raise NotImplementedError(
+                "cir-to-core: cir.if containing break/continue requires "
+                "unstructured function emission"
+            )
+        return _translate_if_unstructured(program_state, ctx, op)
+
     cond = ctx[op.cond]
     if cond is None:
         cond = op.cond
@@ -96,7 +124,6 @@ def translate_if(
     _translate_region_into_block(program_state, ctx, op.then_region, then_block)
     then_block.add_op(scf.YieldOp())
 
-    else_blocks: list[Block]
     if op.else_region.blocks:
         else_block = Block()
         _translate_region_into_block(program_state, ctx, op.else_region, else_block)
@@ -107,6 +134,70 @@ def translate_if(
 
     if_op = scf.IfOp(cond, [], Region([then_block]), else_region)
     return [if_op]
+
+
+def _translate_if_unstructured(
+    program_state: ProgramState,
+    ctx: SSAValueCtx,
+    op: cir.IfOp,
+) -> list[Operation]:
+    """Block-graph lowering of `cir.if` for the unstructured emission mode.
+
+    Splits the current block at the `cir.if`: emits a `cf.cond_br` from the
+    current block into freshly-allocated `then` / (`else`) / `merge` blocks.
+    The merge block becomes the new cursor. Any `cir.break` / `cir.continue`
+    inside the regions terminates the corresponding then/else block instead
+    of falling through.
+    """
+    fn_state = program_state.getCurrentFnState()
+    region = fn_state.function_region
+    assert region is not None
+    cur = fn_state.current_block
+    assert cur is not None
+
+    cond = ctx[op.cond]
+    if cond is None:
+        cond = op.cond
+
+    then_block = Block()
+    region.add_block(then_block)
+    if op.else_region.blocks:
+        else_block: Block | None = Block()
+        region.add_block(else_block)
+    else:
+        else_block = None
+    merge_block = Block()
+    region.add_block(merge_block)
+
+    branch_else = else_block if else_block is not None else merge_block
+    cur.add_op(cf.ConditionalBranchOp(cond, then_block, [], branch_else, []))
+    fn_state.block_terminated = True
+
+    # Translate `then` region into `then_block`, terminate by branching to
+    # `merge_block` if the inner walk didn't already terminate (via
+    # break/continue/return).
+    fn_state.current_block = then_block
+    fn_state.block_terminated = False
+    _translate_region_into_block_unstructured(
+        program_state, ctx, op.then_region
+    )
+    if not fn_state.block_terminated:
+        assert fn_state.current_block is not None
+        fn_state.current_block.add_op(cf.BranchOp(merge_block))
+
+    if else_block is not None:
+        fn_state.current_block = else_block
+        fn_state.block_terminated = False
+        _translate_region_into_block_unstructured(
+            program_state, ctx, op.else_region
+        )
+        if not fn_state.block_terminated:
+            assert fn_state.current_block is not None
+            fn_state.current_block.add_op(cf.BranchOp(merge_block))
+
+    fn_state.current_block = merge_block
+    fn_state.block_terminated = False
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -120,10 +211,42 @@ def translate_scope(
     # `cir.scope` introduces a lexical scope but no SSA boundary; we inline
     # its body into the surrounding block. If it produces results, the
     # trailing `cir.yield` carries them — wire those to `op.results_`.
-    out: list[Operation] = []
     inner_ctx = SSAValueCtx(parent_scope=ctx)
     from xdsl_clang.transforms.cir_to_core import statements
 
+    fn_state = program_state.function_state
+    unstructured = fn_state is not None and fn_state.is_unstructured
+
+    if unstructured:
+        # Append children straight into `current_block` so any nested
+        # unstructured loop / cir.if-with-break can splice fresh blocks in
+        # and update the cursor without our outer collection getting
+        # appended to the wrong (old) block.
+        for body_op in list(op.body.block.ops):
+            if fn_state.block_terminated:
+                break
+            if isa(body_op, cir.YieldOp):
+                yielded = list(body_op.arguments)
+                if yielded:
+                    if len(yielded) != len(op.results_):
+                        raise NotImplementedError(
+                            "cir-to-core: cir.scope yield arity mismatch"
+                        )
+                    for old_res, ssa in zip(op.results_, yielded):
+                        mapped = inner_ctx[ssa]
+                        ctx[old_res] = mapped if mapped is not None else ssa
+                continue
+            for new_op in statements.translate_stmt(
+                program_state, inner_ctx, body_op
+            ):
+                if fn_state.current_block is None:
+                    raise RuntimeError(
+                        "cir-to-core: current_block became None inside cir.scope"
+                    )
+                fn_state.current_block.add_op(new_op)
+        return []
+
+    out: list[Operation] = []
     for body_op in list(op.body.block.ops):
         if isa(body_op, cir.YieldOp):
             yielded = list(body_op.arguments)
@@ -166,8 +289,17 @@ def _build_while_loop(
         or _has_break_or_continue(body_region)
         or (step_region is not None and _has_break_or_continue(step_region))
     ):
-        raise NotImplementedError(
-            "cir-to-core: loop with break/continue (Phase 5 unstructured form)"
+        # Decision 2 / Task 5.7: lower to a `cf.br` / `cf.cond_br` block
+        # graph. The function-level scan in `translate_function` already
+        # flagged this function as `is_unstructured` because some
+        # descendant has break/continue.
+        return _build_unstructured_loop(
+            program_state,
+            ctx,
+            cond_region,
+            body_region,
+            step_region=step_region,
+            body_first=body_first,
         )
 
     # `scf.while` has signature: `before(args) -> i1, before-yield(args)` and
@@ -244,6 +376,152 @@ def translate_dowhile(
 
 
 # ---------------------------------------------------------------------------
+# Unstructured loop emitter (Decision 2, Task 5.7)
+# ---------------------------------------------------------------------------
+
+
+def _translate_region_into_block_unstructured(
+    program_state: ProgramState,
+    ctx: SSAValueCtx,
+    region: Region,
+) -> None:
+    """Translate `region.block` into the current cursor block, allowing any
+    nested control-flow handler to splice fresh blocks and update the cursor.
+
+    The caller is expected to have already set `fn_state.current_block` to
+    the desired starting block. SSA mappings produced inside go into `ctx`
+    so callers can resolve trailing `cir.condition` / `cir.yield` operands
+    afterwards.
+    """
+    from xdsl_clang.transforms.cir_to_core import statements
+
+    fn_state = program_state.getCurrentFnState()
+    for body_op in list(region.block.ops):
+        if fn_state.block_terminated:
+            break
+        if isa(body_op, cir.YieldOp) or isa(body_op, cir.ConditionOp):
+            # Region terminator — the surrounding op consumes it.
+            continue
+        for new_op in statements.translate_stmt(program_state, ctx, body_op):
+            if fn_state.current_block is None:
+                raise RuntimeError(
+                    "cir-to-core: current_block became None inside region"
+                )
+            fn_state.current_block.add_op(new_op)
+
+
+def _build_unstructured_loop(
+    program_state: ProgramState,
+    ctx: SSAValueCtx,
+    cond_region: Region,
+    body_region: Region,
+    *,
+    step_region: Region | None = None,
+    body_first: bool = False,
+) -> list[Operation]:
+    """Lower a `cir.for` / `cir.while` to a block graph using `cf` ops.
+
+    Layout for a for-loop (cond, body, step regions):
+        cur:    cf.br ^header
+        ^header: <cond>; cf.cond_br %c, ^body, ^exit
+        ^body:   <body>; cf.br ^step          (or ^header for while)
+        ^step:   <step>; cf.br ^header        (for only)
+        ^exit:   <continuation — caller threads subsequent ops here>
+
+    `cir.break` inside the body branches to `^exit`.
+    `cir.continue` branches to `^step` (for) or `^header` (while).
+    """
+    if body_first:
+        raise NotImplementedError(
+            "cir-to-core: cir.do unstructured emitter (Task 5.8)"
+        )
+
+    fn_state = program_state.getCurrentFnState()
+    if not fn_state.is_unstructured:
+        raise RuntimeError(
+            "cir-to-core: unstructured loop emitter invoked outside an "
+            "unstructured function (function detection should have flagged it)"
+        )
+    region = fn_state.function_region
+    assert region is not None
+    cur = fn_state.current_block
+    assert cur is not None
+
+    header = Block()
+    body = Block()
+    step: Block | None = Block() if step_region is not None else None
+    exit_block = Block()
+
+    region.add_block(header)
+    region.add_block(body)
+    if step is not None:
+        region.add_block(step)
+    region.add_block(exit_block)
+
+    # Enter the loop.
+    cur.add_op(cf.BranchOp(header))
+
+    # ---- header (cond) ----
+    fn_state.current_block = header
+    fn_state.block_terminated = False
+    cond_ctx = SSAValueCtx(parent_scope=ctx)
+    _translate_region_into_block_unstructured(program_state, cond_ctx, cond_region)
+    cond_term = (
+        list(cond_region.block.ops)[-1] if cond_region.block.ops else None
+    )
+    if cond_term is None or not isa(cond_term, cir.ConditionOp):
+        raise NotImplementedError(
+            "cir-to-core: malformed loop cond region (no cir.condition terminator)"
+        )
+    cond_val = cond_ctx[cond_term.cond]
+    if cond_val is None:
+        cond_val = cond_term.cond
+    if fn_state.current_block is None:
+        raise RuntimeError(
+            "cir-to-core: cond region nulled current_block in loop emitter"
+        )
+    fn_state.current_block.add_op(
+        cf.ConditionalBranchOp(cond_val, body, [], exit_block, [])
+    )
+
+    # ---- body ----
+    latch = step if step is not None else header
+    fn_state.break_targets.append(exit_block)
+    fn_state.continue_targets.append(latch)
+    try:
+        fn_state.current_block = body
+        fn_state.block_terminated = False
+        body_ctx = SSAValueCtx(parent_scope=ctx)
+        _translate_region_into_block_unstructured(
+            program_state, body_ctx, body_region
+        )
+        if not fn_state.block_terminated:
+            assert fn_state.current_block is not None
+            fn_state.current_block.add_op(cf.BranchOp(latch))
+    finally:
+        fn_state.break_targets.pop()
+        fn_state.continue_targets.pop()
+
+    # ---- step (for-only) ----
+    if step is not None:
+        fn_state.current_block = step
+        fn_state.block_terminated = False
+        step_ctx = SSAValueCtx(parent_scope=ctx)
+        assert step_region is not None
+        _translate_region_into_block_unstructured(
+            program_state, step_ctx, step_region
+        )
+        if not fn_state.block_terminated:
+            assert fn_state.current_block is not None
+            fn_state.current_block.add_op(cf.BranchOp(header))
+
+    # Caller continues in the exit block.
+    fn_state.current_block = exit_block
+    fn_state.block_terminated = False
+    return []
+
+
+# ---------------------------------------------------------------------------
 # Region terminators handled by their parents — reaching these directly
 # means a malformed CIR module.
 # ---------------------------------------------------------------------------
@@ -266,13 +544,35 @@ def translate_condition(
 def translate_break(
     program_state: ProgramState, ctx: SSAValueCtx, op: cir.BreakOp
 ) -> list[Operation]:
-    return _todo("break (Phase 5)")
+    fn_state = program_state.function_state
+    if fn_state is None or not fn_state.break_targets:
+        raise RuntimeError(
+            "cir-to-core: cir.break outside of a loop body (or function not "
+            "running in unstructured mode)"
+        )
+    target = fn_state.break_targets[-1]
+    if fn_state.current_block is None:
+        raise RuntimeError("cir-to-core: cir.break has no current block")
+    fn_state.current_block.add_op(cf.BranchOp(target))
+    fn_state.block_terminated = True
+    return []
 
 
 def translate_continue(
     program_state: ProgramState, ctx: SSAValueCtx, op: cir.ContinueOp
 ) -> list[Operation]:
-    return _todo("continue (Phase 5)")
+    fn_state = program_state.function_state
+    if fn_state is None or not fn_state.continue_targets:
+        raise RuntimeError(
+            "cir-to-core: cir.continue outside of a loop body (or function "
+            "not running in unstructured mode)"
+        )
+    target = fn_state.continue_targets[-1]
+    if fn_state.current_block is None:
+        raise RuntimeError("cir-to-core: cir.continue has no current block")
+    fn_state.current_block.add_op(cf.BranchOp(target))
+    fn_state.block_terminated = True
+    return []
 
 
 def _block_map(program_state: ProgramState) -> dict[Block, Block]:
@@ -371,6 +671,11 @@ def translate_return(
     for a in op.arguments:
         mapped = ctx[a]
         args.append(mapped if mapped is not None else a)
+    fn_state = program_state.function_state
+    if fn_state is not None and fn_state.is_unstructured:
+        # Mark the current block terminated so the driver doesn't try to
+        # append further ops past an early return.
+        fn_state.block_terminated = True
     return [func.ReturnOp(*args)]
 
 

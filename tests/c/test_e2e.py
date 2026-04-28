@@ -46,14 +46,16 @@ EXPECTED_FAIL = {
     "fragments/allocatables.c",
     "fragments/array_ops.c",  # malloc/free void* bitcast
     "fragments/pointers.c",
-    # break/continue
-    "fragments/do_loops.c",
-    "fragments/while_loops.c",
+    # Task 5.7 unblocked do_loops and while_loops — they pass end-to-end.
+    # jacobi.c also lowers and runs, but takes ~2 minutes to complete
+    # (CPU-bound iterative solver) which exceeds the per-test timeout in
+    # this harness; keep it on the xfail list until a smaller-grid harness
+    # variant is available.
+    "solvers/jacobi.c",
     # cir.br (block-graph control flow from C)
     "fragments/procedures.c",
     "fragments/conditionals.c",  # cir.return inside cir.if
     # heavy benchmarks — Phase 5
-    "solvers/jacobi.c",
     "solvers/gauss_seidel_stack.c",
     "solvers/gauss_seidel_heap.c",
     "advection/tra_adv.c",

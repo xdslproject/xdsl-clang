@@ -92,10 +92,16 @@ class GatherFunctionInformation(Visitor):
         else:
             return_type_for_def = return_type
         is_definition_only = len(op.body.blocks) == 0
+        # Phase 5 Task 5.7 follow-up: track variadics so extern decls /
+        # call sites can switch to `llvm.func` / `llvm.call` (the func
+        # dialect has no variadic support — needed for `printf` & friends
+        # in `jacobi.c` once break/continue is lowered).
+        is_var_arg = bool(op.function_type.varargs)
         fn_def = FunctionDefinition(
             name=fn_name,
             return_type=return_type_for_def,
             is_definition_only=is_definition_only,
+            is_var_arg=is_var_arg,
         )
         for input_type in op.function_type.inputs.data:
             is_scalar = not (

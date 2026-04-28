@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from xdsl.ir import Attribute, Operation
+    from xdsl.ir import Attribute, Block, Operation, Region
 
 
 @dataclass
@@ -60,6 +60,7 @@ class FunctionDefinition:
     name: str
     return_type: "Attribute | None"
     is_definition_only: bool
+    is_var_arg: bool = False
     args: list[ArgumentDefinition] = field(
         default_factory=list[ArgumentDefinition]
     )
@@ -89,6 +90,30 @@ class ComponentState:
     index_chain: dict[object, list[object]] = field(
         default_factory=dict[object, list[object]]
     )
+    # --- Unstructured emission state (Task 5.7) --------------------------
+    # When a function contains a `cir.break` / `cir.continue`, control-flow
+    # handlers switch to a block-graph emission mode. The following fields
+    # describe that mode:
+    #   * `is_unstructured` is True iff the active function uses the
+    #     unstructured emitter for its top-level body (and any ifs / loops
+    #     containing break/continue).
+    #   * `current_block` is the cursor: every op produced by an unstructured
+    #     handler is appended here. Control-flow handlers (loops, ifs with
+    #     break/continue) may swap it for a fresh block.
+    #   * `function_region` is the region those new blocks should be added
+    #     to.
+    #   * `break_targets` / `continue_targets` are stacks of MLIR blocks
+    #     that `cir.break` / `cir.continue` should branch to. Pushed by
+    #     each unstructured loop emitter, popped on exit.
+    #   * `block_terminated` flags that the current block has already
+    #     received a terminator (cf.br / cf.cond_br / func.return) so the
+    #     driver should drop any remaining (dead) ops in the source block.
+    is_unstructured: bool = False
+    current_block: "Block | None" = None
+    function_region: "Region | None" = None
+    break_targets: list["Block"] = field(default_factory=list["Block"])
+    continue_targets: list["Block"] = field(default_factory=list["Block"])
+    block_terminated: bool = False
 
 
 class ProgramState:
