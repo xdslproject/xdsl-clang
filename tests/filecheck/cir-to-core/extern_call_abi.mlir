@@ -81,7 +81,7 @@ module {
   }
   // CHECK:      func.func @run_printf_noargs(%[[F:.*]]: memref<?xi8>) -> i32 {
   // CHECK:        %[[FP:.*]] = llvm.inttoptr %{{.*}} : i64 to !llvm.ptr
-  // CHECK-NEXT:   %{{.*}} = llvm.call @printf(%[[FP]]) vararg(!llvm.func<i32 (!llvm.ptr, ...)>) : (!llvm.ptr) -> i32
+  // CHECK-NEXT:   %{{.*}} = "llvm.call"(%[[FP]]){{.*}}callee = @printf{{.*}}var_callee_type = !llvm.func<i32 (!llvm.ptr, ...)>{{.*}}: (!llvm.ptr) -> i32
 
   // Variadic args of mixed types: the format pointer goes through the
   // memref → `!llvm.ptr` bridge; the trailing scalar passes through.
@@ -91,5 +91,5 @@ module {
   }
   // CHECK:      func.func @run_printf_mixed(%[[F2:.*]]: memref<?xi8>, %[[N:.*]]: i64) -> i32 {
   // CHECK:        %[[FP2:.*]] = llvm.inttoptr %{{.*}} : i64 to !llvm.ptr
-  // CHECK-NEXT:   %{{.*}} = llvm.call @printf(%[[FP2]], %{{.*}}) vararg(!llvm.func<i32 (!llvm.ptr, ...)>) : (!llvm.ptr, i64) -> i32
+  // CHECK-NEXT:   %{{.*}} = "llvm.call"(%[[FP2]], %{{.*}}){{.*}}callee = @printf{{.*}}var_callee_type = !llvm.func<i32 (!llvm.ptr, ...)>{{.*}}: (!llvm.ptr, i64) -> i32
 }
