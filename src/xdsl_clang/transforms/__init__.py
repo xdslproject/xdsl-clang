@@ -6,5 +6,11 @@ from xdsl.passes import ModulePass
 def get_all_passes() -> dict[str, Callable[[], type[ModulePass]]]:
     """Return the list of all available passes."""
 
-    # Add your passes here to be discovered by `xdsl-opt`
-    return {}
+    def get_cir_to_core() -> type[ModulePass]:
+        from xdsl_clang.transforms.cir_to_core import CIRToCore
+
+        return CIRToCore
+
+    return {
+        "cir-to-core": get_cir_to_core,
+    }

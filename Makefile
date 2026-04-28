@@ -29,6 +29,11 @@ pyright: .venv/
 .PHONY: tests
 tests: pytest filecheck
 
+.PHONY: tests-c
+tests-c: .venv/
+	$(MAKE) -C tests/c/build baseline
+	uv run pytest tests/c/test_e2e.py -v
+
 .PHONY: pytest
 pytest: .venv/
 	uv run pytest -W error --cov

@@ -1,0 +1,143 @@
+"""Program-state record carried through CIR → core lowering.
+
+C-specific analogue of ``ftn/transforms/to_core/misc/fortran_code_description.py``.
+Much smaller because C has no INTENT, no allocatable descriptors, no
+character-box ABI — but the same shape (per-function ``ComponentState``
+nested inside a global ``ProgramState``) so handlers from the two projects
+read identically.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from xdsl.ir import Attribute, Operation
+
+
+@dataclass
+class FieldDef:
+    """One field of a ``!cir.record`` after layout resolution.
+
+    ``index`` is the field's position in the lowered ``!llvm.struct``.
+    ``cir_type`` is kept around so handlers can re-derive sign/element info.
+    """
+
+    name: str
+    index: int
+    cir_type: "Attribute"
+
+
+@dataclass
+class RecordLayout:
+    """Lowered layout for a single ``!cir.record`` symbol."""
+
+    name: str
+    fields: list[FieldDef] = field(default_factory=list[FieldDef])
+
+    def index_of(self, field_name: str) -> int:
+        for f in self.fields:
+            if f.name == field_name:
+                return f.index
+        raise KeyError(f"unknown field {field_name!r} in record {self.name!r}")
+
+
+@dataclass
+class ArgumentDefinition:
+    """One formal parameter of a CIR function."""
+
+    name: str
+    cir_type: "Attribute"
+    # `True` for plain scalars, `False` for pointer/array decayed args.
+    is_scalar: bool
+
+
+@dataclass
+class FunctionDefinition:
+    """Resolved metadata for a single ``cir.func``."""
+
+    name: str
+    return_type: "Attribute | None"
+    is_definition_only: bool
+    args: list[ArgumentDefinition] = field(
+        default_factory=list[ArgumentDefinition]
+    )
+
+    def add_arg_def(self, arg_def: ArgumentDefinition) -> None:
+        self.args.append(arg_def)
+
+
+@dataclass
+class GlobalCIRComponent:
+    """One ``cir.global`` (constant or otherwise) gathered up front."""
+
+    sym_name: str
+    cir_type: "Attribute"
+    cir_op: "Operation"
+
+
+@dataclass
+class ComponentState:
+    """Per-function bookkeeping. Currently a thin record; grows with the
+    pass (allocas-by-name caches, loop nesting state, etc.)."""
+
+    fn_name: str | None = None
+    # `index_chain[<cir-ssa-result-of-ptr_stride/get_element>]` holds the
+    # accumulated list of `index`-typed SSA values to use when the eventual
+    # `memref.load` / `memref.store` fires. Cleared on function entry.
+    index_chain: dict[object, list[object]] = field(
+        default_factory=dict[object, list[object]]
+    )
+
+
+class ProgramState:
+    """Module-level bookkeeping shared by every component handler."""
+
+    function_definitions: dict[str, FunctionDefinition]
+    record_layouts: dict[str, RecordLayout]
+    cir_globals: dict[str, GlobalCIRComponent]
+    string_literals: dict[str, str]  # text → emitted symbol name
+    is_in_global: bool
+    function_state: ComponentState | None
+
+    def __init__(self) -> None:
+        self.function_definitions = {}
+        self.record_layouts = {}
+        self.cir_globals = {}
+        self.string_literals = {}
+        self.is_in_global = False
+        self.function_state = None
+
+    # --- function scoping -------------------------------------------------
+
+    def addFunctionDefinition(self, name: str, fn_def: FunctionDefinition) -> None:
+        if name in self.function_definitions:
+            raise KeyError(f"function {name!r} declared twice")
+        self.function_definitions[name] = fn_def
+
+    def enterFunction(self, fn_name: str) -> None:
+        if self.function_state is not None:
+            raise RuntimeError("nested function entry not supported")
+        self.function_state = ComponentState(fn_name=fn_name)
+
+    def getCurrentFnState(self) -> ComponentState:
+        if self.function_state is None:
+            raise RuntimeError("not inside a function")
+        return self.function_state
+
+    def leaveFunction(self) -> None:
+        self.function_state = None
+
+    # --- global-scope toggling -------------------------------------------
+
+    def enterGlobal(self) -> None:
+        if self.function_state is not None:
+            raise RuntimeError("can't enter global from inside a function")
+        self.is_in_global = True
+
+    def leaveGlobal(self) -> None:
+        self.is_in_global = False
+
+    def isInGlobal(self) -> bool:
+        return self.is_in_global

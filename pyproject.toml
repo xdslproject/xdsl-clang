@@ -17,6 +17,9 @@ dynamic = ["version"]
 [project.entry-points.'xdsl.universe']
 xdsl_clang = 'xdsl_clang.universe:XDSL_CLANG_UNIVERSE'
 
+[project.scripts]
+xclang = "xdsl_clang.tools.xclang:main"
+
 [project.urls]
 Homepage = "https://xdsl.dev/xdsl-clang"
 "Source Code" = "https://github.com/xdslproject/xdsl-clang"
