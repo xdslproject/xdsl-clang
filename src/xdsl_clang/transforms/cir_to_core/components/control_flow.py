@@ -81,6 +81,14 @@ def _has_break_or_continue(region: Region) -> bool:
     return False
 
 
+def _has_return(region: Region) -> bool:
+    for block in region.blocks:
+        for op in block.walk():
+            if isa(op, cir.ReturnOp):
+                return True
+    return False
+
+
 def _yielded_values(region: Region, ctx: SSAValueCtx) -> list[SSAValue]:
     """Find the trailing `cir.yield` and resolve its operands via `ctx`."""
     last = list(region.block.ops)[-1] if region.block.ops else None
@@ -105,14 +113,18 @@ def translate_if(
     has_bc = _has_break_or_continue(op.then_region) or _has_break_or_continue(
         op.else_region
     )
-    if has_bc:
+    has_ret = _has_return(op.then_region) or _has_return(op.else_region)
+    if has_bc or has_ret:
         # Lower to a `cf.cond_br` block-graph diamond. The function-level
         # scan in `translate_function` already flagged this function as
-        # `is_unstructured` because some descendant has break/continue.
+        # `is_unstructured` because some descendant has break/continue
+        # or a nested cir.return (Task 5.1: early-return inside cir.if
+        # can't live inside scf.if because func.return demands a func.func
+        # parent).
         if fn_state is None or not fn_state.is_unstructured:
             raise NotImplementedError(
-                "cir-to-core: cir.if containing break/continue requires "
-                "unstructured function emission"
+                "cir-to-core: cir.if containing break/continue/return "
+                "requires unstructured function emission"
             )
         return _translate_if_unstructured(program_state, ctx, op)
 

@@ -52,14 +52,18 @@ EXPECTED_FAIL = {
     # this harness; keep it on the xfail list until a smaller-grid harness
     # variant is available.
     "solvers/jacobi.c",
-    # cir.br (block-graph control flow from C)
+    # `procedures.c` lowers past the index-arity error but trips a
+    # call-site rank mismatch: a local `int val` (rank-0 `memref<i32>`)
+    # is passed to a function whose `int *b` arg lowers to rank-1
+    # `memref<?xi32>` — separate Task 5.5 follow-up.
     "fragments/procedures.c",
-    "fragments/conditionals.c",  # cir.return inside cir.if
-    # heavy benchmarks — Phase 5
-    "solvers/gauss_seidel_stack.c",
-    "solvers/gauss_seidel_heap.c",
+    # heavy benchmarks — Phase 5. `tra_adv.c` builds and runs end-to-end
+    # but the kernel is a heavy numerical simulation that exceeds the
+    # harness's per-test runtime budget. `swm/swm*.c` still hit a
+    # `cir.load` of a struct field via `cir.get_member` returning
+    # `!llvm.ptr` — needs an `llvm.load` fallback for `!llvm.ptr`-typed
+    # addresses (struct-field handling — separate blocker).
     "advection/tra_adv.c",
-    "advection/pwadvection.c",
     "swm/swm.c",
     "swm/swm_orig.c",
 }

@@ -66,6 +66,21 @@ def _has_break_or_continue_anywhere(op: cir.FuncOp) -> bool:
     return False
 
 
+def _has_nested_return(op: cir.FuncOp) -> bool:
+    """True iff a `cir.return` appears inside any *nested* region of the
+    function body (e.g. inside a `cir.if` or `cir.scope`). Returns at the
+    function body's block scope are fine — the structured emitter handles
+    those. Nested returns force the unstructured emitter (Task 5.1)."""
+    for block in op.body.blocks:
+        for top_op in block.ops:
+            for region in top_op.regions:
+                for nested_block in region.blocks:
+                    for nested_op in nested_block.walk():
+                        if isa(nested_op, cir.ReturnOp):
+                            return True
+    return False
+
+
 def translate_function(
     program_state: ProgramState, ctx: SSAValueCtx, op: cir.FuncOp
 ) -> Operation | None:
@@ -128,7 +143,9 @@ def translate_function(
     fn_state = program_state.getCurrentFnState()
     setattr(program_state, "_block_map", block_map)
     fn_state.function_region = new_region
-    fn_state.is_unstructured = _has_break_or_continue_anywhere(op)
+    fn_state.is_unstructured = _has_break_or_continue_anywhere(
+        op
+    ) or _has_nested_return(op)
     try:
         from xdsl_clang.transforms.cir_to_core import statements
 
