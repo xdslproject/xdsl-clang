@@ -84,7 +84,7 @@ class GatherFunctionInformation(Visitor):
         # `translate_call` and lowered to `memref.alloc` / `memref.dealloc`
         # — we never want to emit `func.func` declarations for them, so
         # skip them entirely from the function table. See Phase 5 Task 5.4.
-        if fn_name in ("malloc", "free"):
+        if fn_name in ("malloc", "calloc", "free"):
             return
         return_type = op.function_type.return_type
         if isa(return_type, cir.VoidType):

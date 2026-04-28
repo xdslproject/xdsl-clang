@@ -54,9 +54,29 @@ module {
   // CHECK:        %[[Q:.*]] = memref.alloc(%[[N2]]) : memref<?xi32>
   // CHECK:        memref.dealloc %{{.*}} : memref<?xi32>
 
-  // No `func.func @malloc` or `func.func @free` declarations should
-  // appear in the lowered module — they're elided externs (Phase 5
-  // Task 5.4 / Decision 5.4).
+  // Phase F1: `calloc(n, size)` is recognised the same way as `malloc`,
+  // with the byte count materialised as an explicit `arith.muli`. The
+  // call to `@calloc` is elided in the same way as `@malloc`.
+  cir.func private @calloc(!u64i, !u64i) -> !cir.ptr<!void>
+  cir.func @calloc_int() {
+    %0 = cir.alloca !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>, ["r", init] {alignment = 8 : i64}
+    %n = cir.const #cir.int<8> : !u64i
+    %sz = cir.const #cir.int<4> : !u64i
+    %p = cir.call @calloc(%n, %sz) : (!u64i, !u64i) -> !cir.ptr<!void>
+    %t = cir.cast bitcast %p : !cir.ptr<!void> -> !cir.ptr<!s32i>
+    cir.store %t, %0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    cir.return
+  }
+  // CHECK-LABEL: func.func @calloc_int()
+  // CHECK:        %[[NB:.*]] = arith.muli %{{.*}}, %{{.*}} : i64
+  // CHECK:        %[[NIDX:.*]] = arith.index_cast %[[NB]] : i64 to index
+  // CHECK:        %[[ESZ:.*]] = arith.constant 4 : index
+  // CHECK:        %[[NE:.*]] = arith.divui %[[NIDX]], %[[ESZ]] : index
+  // CHECK:        %[[CR:.*]] = memref.alloc(%[[NE]]) : memref<?xi32>
+
+  // No `func.func @malloc`, `@calloc`, or `@free` declarations should
+  // appear in the lowered module — they're elided externs.
   // CHECK-NOT: func.func{{.*}}@malloc
+  // CHECK-NOT: func.func{{.*}}@calloc
   // CHECK-NOT: func.func{{.*}}@free
 }

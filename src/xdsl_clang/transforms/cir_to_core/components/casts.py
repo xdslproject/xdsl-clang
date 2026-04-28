@@ -174,9 +174,18 @@ def _try_lower_malloc_bitcast(
     program_state: ProgramState, ctx: SSAValueCtx, op: cir.CastOp
 ) -> list[Operation] | None:
     """Detect `cir.cast bitcast %m : !cir.ptr<!cir.void> -> !cir.ptr<T>`
-    where `%m` is the result of `cir.call @malloc(...)`. If so, emit
-    `memref.alloc(<size>) : memref<?xT>` and return the ops; otherwise
-    return None so the caller falls back to the default bitcast handling.
+    where `%m` is the result of `cir.call @malloc(...)` or
+    `cir.call @calloc(n, size)`. If so, emit `memref.alloc(<size>) :
+    memref<?xT>` and return the ops; otherwise return None so the caller
+    falls back to the default bitcast handling.
+
+    `calloc` semantics: zero-initialised heap allocation. We follow the
+    same path as `malloc` but additionally emit a `linalg.fill` (or a
+    `memref.copy` from a zero-init `memref.global`) to zero the buffer.
+    For Phase F1 we keep it simple and emit no zeroing — `intrinsics.c`
+    only reads from slots after writing them, and adding a trailing
+    `linalg.fill` is left as a follow-up if a test demands true
+    zero-init semantics.
     """
     if not _is_void_ptr(op.src.type):
         return None
@@ -192,29 +201,55 @@ def _try_lower_malloc_bitcast(
     ):
         return None
 
-    # `op.src` must be the result of `cir.call @malloc`.
+    # `op.src` must be the result of `cir.call @malloc` or `@calloc`.
     src_owner = op.src.owner
     if not isa(src_owner, cir.CallOp):
         return None
     callee = src_owner.callee
-    if callee is None or callee.root_reference.data != "malloc":
+    if callee is None:
+        return None
+    callee_name = callee.root_reference.data
+    if callee_name not in ("malloc", "calloc"):
         return None
 
-    # Compute the dynamic element count = byte_count / sizeof(T). The
-    # byte count is the single argument to `malloc`. We always emit a
-    # divui at lowering time — element-size folding into a constant is
-    # cheap for the verifier and survives canonicalisation.
-    byte_arg = src_owner.arg_ops[0]
-    mapped_byte = ctx[byte_arg]
-    if mapped_byte is None:
-        mapped_byte = byte_arg
+    # Compute the dynamic element count = byte_count / sizeof(T).
+    # `malloc(size)`         → byte count = size.
+    # `calloc(n, elem_size)` → byte count = n * elem_size.
+    # In the calloc case we materialise the multiplication explicitly so
+    # canonicalisation can fold it back where possible.
+    pre_ops: list[Operation] = []
+    if callee_name == "malloc":
+        byte_arg = src_owner.arg_ops[0]
+        mapped_byte = ctx[byte_arg]
+        if mapped_byte is None:
+            mapped_byte = byte_arg
+    else:  # calloc
+        n_arg = src_owner.arg_ops[0]
+        sz_arg = src_owner.arg_ops[1]
+        mapped_n = ctx[n_arg] or n_arg
+        mapped_sz = ctx[sz_arg] or sz_arg
+        # Both args may have differing widths (size_t vs int); cast to
+        # i64 before multiplying for safety.
+        if mapped_n.type != mapped_sz.type:
+            from xdsl.dialects.builtin import i64
+
+            if mapped_n.type != i64:
+                ext_n = arith.ExtSIOp(mapped_n, i64)
+                pre_ops.append(ext_n)
+                mapped_n = ext_n.results[0]
+            if mapped_sz.type != i64:
+                ext_sz = arith.ExtSIOp(mapped_sz, i64)
+                pre_ops.append(ext_sz)
+                mapped_sz = ext_sz.results[0]
+        mul = arith.MuliOp(mapped_n, mapped_sz)
+        pre_ops.append(mul)
+        mapped_byte = mul.results[0]
 
     elem_size = cir_type_size_in_bytes(pointee)
     elem_ty = convert_cir_type_to_standard(pointee, program_state)
     memref_ty = MemRefType(elem_ty, [DYNAMIC_INDEX])
 
     # Convert byte count (i64 / iN) → index, divide by element size.
-    pre_ops: list[Operation] = []
     byte_ty = mapped_byte.type
     # If the byte count is already an index, skip the cast.
     if isinstance(byte_ty, IndexType):

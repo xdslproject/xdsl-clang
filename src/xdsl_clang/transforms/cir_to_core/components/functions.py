@@ -85,9 +85,10 @@ def translate_function(
     program_state: ProgramState, ctx: SSAValueCtx, op: cir.FuncOp
 ) -> Operation | None:
     sym = op.sym_name.data
-    # `malloc` / `free` are folded into `memref.alloc` / `memref.dealloc`
-    # at the cast/call sites; never emit `func.func` declarations for them.
-    if sym in ("malloc", "free"):
+    # `malloc` / `calloc` / `free` are folded into `memref.alloc` /
+    # `memref.dealloc` at the cast/call sites; never emit `func.func`
+    # declarations for them.
+    if sym in ("malloc", "calloc", "free"):
         return None
 
     is_extern = len(op.body.blocks) == 0
@@ -191,14 +192,12 @@ def translate_call(
 
     callee_sym = op.callee.root_reference.data
 
-    # Phase 5 Task 5.4: pattern-match the malloc/free idiom.
-    if callee_sym == "malloc":
-        # The result of `cir.call @malloc` is consumed by a subsequent
-        # `cir.cast bitcast` to `!cir.ptr<T>`; that cast handler emits the
-        # `memref.alloc` directly. Emit nothing here — the cast will walk
-        # back through the call. Mark the result as un-mapped so that an
-        # accidental use of the void* result outside of the bitcast
-        # surfaces as a clear error rather than a silent miscompile.
+    # Phase 5 Task 5.4 + F1: pattern-match the malloc/calloc/free idiom.
+    if callee_sym in ("malloc", "calloc"):
+        # The result of `cir.call @malloc` / `@calloc` is consumed by a
+        # subsequent `cir.cast bitcast` to `!cir.ptr<T>`; that cast
+        # handler emits the `memref.alloc` directly. Emit nothing here —
+        # the cast walks back through the call.
         return []
 
     if callee_sym == "free":

@@ -34,15 +34,10 @@ SKIP_FILES = {"swm_openmp.c"}
 # Phase 5 hardening turns these into xpass — list of test ids that we
 # expect to fail (strict=False so xpass doesn't error).
 EXPECTED_FAIL = {
-    # Function-local !cir.const #cir.const_array<...> of array type — Task
-    # 5.2 lands const-array hoisting, but `intrinsics.c` separately uses
-    # `calloc`, which the malloc/free pattern doesn't yet handle (so it
-    # still fails at the cir-to-core stage); `allocatables.c` lowers its
-    # const-array init but trips a different downstream blocker —
-    # `static float *global_array = NULL;` lowers to `memref<memref<f32>>`
-    # while malloc emits `memref<?xf32>`, so the global-pointer assignment
-    # fails type matching. Both tracked alongside Task 5.4 follow-ups.
-    "fragments/intrinsics.c",
+    # `allocatables.c` lowers its const-array init but trips a different
+    # downstream blocker — `static float *global_array = NULL;` lowers to
+    # `memref<memref<f32>>` while malloc emits `memref<?xf32>`, so the
+    # global-pointer assignment fails type matching. Tracked as Task F2.
     "fragments/allocatables.c",
     "fragments/array_ops.c",  # malloc/free void* bitcast
     "fragments/pointers.c",
