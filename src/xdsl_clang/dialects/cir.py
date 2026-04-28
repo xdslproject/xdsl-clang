@@ -2897,7 +2897,7 @@ class BrCondOp(IRDLOperation):
     successor = var_successor_def()
     traits = traits_def(IsTerminator())
 
-    irdl_options = [AttrSizedOperandSegments()]
+    irdl_options = (AttrSizedOperandSegments(),)
 
 
 @irdl_op_definition
@@ -3047,7 +3047,7 @@ class SwitchFlatOp(IRDLOperation):
     successor = var_successor_def()
     traits = traits_def(IsTerminator())
 
-    irdl_options = [AttrSizedOperandSegments()]
+    irdl_options = (AttrSizedOperandSegments(),)
 
     @classmethod
     def parse(cls, parser: Parser) -> SwitchFlatOp:
