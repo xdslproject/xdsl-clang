@@ -137,6 +137,43 @@ def _convert_record(
 # ---------------------------------------------------------------------------
 
 
+def cir_type_size_in_bytes(cir_type: Attribute) -> int:
+    """Return the byte size of a CIR scalar/record type.
+
+    Used by the `malloc`/`free` cir.cast pattern in `casts.py` to convert
+    a byte-count operand back into an element count for `memref.alloc`.
+    Sizes mirror the data-layout used elsewhere in the corpus:
+
+    * `!cir.int<_, N>` → ceil(N/8)
+    * `!cir.float`     → 4
+    * `!cir.double`    → 8
+    * `!cir.bool`      → 1
+    * `!cir.array<T x N>` → N * sizeof(T)
+    * `!cir.record<…>` → sum of field sizes (no alignment padding modelled)
+    """
+    if isa(cir_type, cir.IntType):
+        return (cir_type.bitwidth + 7) // 8
+    if isa(cir_type, cir.BoolType):
+        return 1
+    if isa(cir_type, cir.SingleType):
+        return 4
+    if isa(cir_type, cir.DoubleType):
+        return 8
+    if isa(cir_type, cir.ArrayType):
+        return cir_type.size.value.data * cir_type_size_in_bytes(cir_type.element_type)
+    if isa(cir_type, cir.RecordType):
+        total = 0
+        for member in cir_type.members.data:
+            total += cir_type_size_in_bytes(member)
+        return total
+    if isa(cir_type, cir.PointerType):
+        # 64-bit target.
+        return 8
+    raise NotImplementedError(
+        f"cir_type_size_in_bytes: unsupported type {cir_type}"
+    )
+
+
 def signedness_of(value: SSAValue) -> bool | None:
     """Best-effort extraction of source-level signedness for an SSA value.
 

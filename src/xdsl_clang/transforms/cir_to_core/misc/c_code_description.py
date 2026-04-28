@@ -100,6 +100,11 @@ class ProgramState:
     string_literals: dict[str, str]  # text → emitted symbol name
     is_in_global: bool
     function_state: ComponentState | None
+    # Module-level prelude ops to splice in front of the lowered module body
+    # (used by component handlers to hoist e.g. `memref.global` for
+    # function-local constant arrays — Task 5.2).
+    module_prelude_ops: list["Operation"]
+    next_literal_id: int
 
     def __init__(self) -> None:
         self.function_definitions = {}
@@ -108,6 +113,20 @@ class ProgramState:
         self.string_literals = {}
         self.is_in_global = False
         self.function_state = None
+        self.module_prelude_ops = []
+        self.next_literal_id = 0
+
+    # --- module prelude (hoisted globals) --------------------------------
+
+    def fresh_literal_symbol(self) -> str:
+        """Mint a unique private-global symbol name for hoisted constants."""
+        sym = f"_xclang_lit{self.next_literal_id}"
+        self.next_literal_id += 1
+        return sym
+
+    def append_module_prelude_op(self, op: "Operation") -> None:
+        """Queue an op to be spliced into the front of the lowered module."""
+        self.module_prelude_ops.append(op)
 
     # --- function scoping -------------------------------------------------
 

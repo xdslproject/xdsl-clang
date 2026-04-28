@@ -21,6 +21,8 @@ from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
     Float32Type,
     Float64Type,
+    IndexType,
+    IntegerAttr,
     IntegerType,
     MemRefType,
 )
@@ -29,6 +31,7 @@ from xdsl.utils.hints import isa
 
 from xdsl_clang.dialects import cir
 from xdsl_clang.transforms.cir_to_core.components.cir_types import (
+    cir_type_size_in_bytes,
     convert_cir_type_to_standard,
     signedness_of,
 )
@@ -67,7 +70,27 @@ def translate_cast(
                 return [cst]
         ctx[op.results[0]] = src
         return []
-    if kind in ("bitcast", "ptr_to_int", "int_to_ptr"):
+    if kind == "bitcast":
+        # Phase 5 Task 5.4: pattern-match `void* ↔ T*` bitcasts around the
+        # `malloc` / `free` C idiom and lower them to `memref.alloc` /
+        # `memref.dealloc` directly. This avoids ever producing
+        # `unrealized_conversion_cast`s between `!llvm.ptr` and
+        # `memref<?xT>`, which can't be reconciled at the LLVM stage.
+        malloc_alloc = _try_lower_malloc_bitcast(program_state, ctx, op)
+        if malloc_alloc is not None:
+            return malloc_alloc
+        if _is_free_void_ptr_bitcast(op):
+            # Result is consumed by a subsequent `cir.call @free`; emit
+            # nothing here and let the call handler dealloc the typed
+            # memref directly. Map the result to the underlying value so
+            # any defensive lookup still works.
+            ctx[op.results[0]] = src
+            return []
+        # Default: at the lowered level the memref/llvm.ptr representation
+        # absorbs the bitcast.
+        ctx[op.results[0]] = src
+        return []
+    if kind in ("ptr_to_int", "int_to_ptr"):
         # Memref/llvm.ptr representation absorbs these.
         ctx[op.results[0]] = src
         return []
@@ -122,6 +145,108 @@ def _int_zero_attr(ty):
     from xdsl.dialects.builtin import IntegerAttr
 
     return IntegerAttr(0, ty)
+
+
+def _is_void_ptr(ty) -> bool:
+    return isa(ty, cir.PointerType) and isa(ty.pointee, cir.VoidType)
+
+
+def _is_free_void_ptr_bitcast(op: cir.CastOp) -> bool:
+    """Return True if `op` is the `T* -> void*` bitcast feeding a
+    subsequent `cir.call @free` in the same block.
+    """
+    if not _is_void_ptr(op.res.type):
+        return False
+    if not isa(op.src.type, cir.PointerType):
+        return False
+    # Walk forward in the block looking for a `cir.call @free` that uses
+    # `op.res` as its only argument.
+    for use in op.results[0].uses:
+        owner = use.operation
+        if isa(owner, cir.CallOp):
+            callee = owner.callee
+            if callee is not None and callee.root_reference.data == "free":
+                return True
+    return False
+
+
+def _try_lower_malloc_bitcast(
+    program_state: ProgramState, ctx: SSAValueCtx, op: cir.CastOp
+) -> list[Operation] | None:
+    """Detect `cir.cast bitcast %m : !cir.ptr<!cir.void> -> !cir.ptr<T>`
+    where `%m` is the result of `cir.call @malloc(...)`. If so, emit
+    `memref.alloc(<size>) : memref<?xT>` and return the ops; otherwise
+    return None so the caller falls back to the default bitcast handling.
+    """
+    if not _is_void_ptr(op.src.type):
+        return None
+    dst_ty = op.res.type
+    if not isa(dst_ty, cir.PointerType):
+        return None
+    pointee = dst_ty.pointee
+    # Records / functions / nested void* aren't sensible malloc targets
+    # in the corpus — bail to the default and let the existing cast logic
+    # handle them.
+    if isa(pointee, cir.RecordType) or isa(pointee, cir.FuncType) or isa(
+        pointee, cir.VoidType
+    ):
+        return None
+
+    # `op.src` must be the result of `cir.call @malloc`.
+    src_owner = op.src.owner
+    if not isa(src_owner, cir.CallOp):
+        return None
+    callee = src_owner.callee
+    if callee is None or callee.root_reference.data != "malloc":
+        return None
+
+    # Compute the dynamic element count = byte_count / sizeof(T). The
+    # byte count is the single argument to `malloc`. We always emit a
+    # divui at lowering time — element-size folding into a constant is
+    # cheap for the verifier and survives canonicalisation.
+    byte_arg = src_owner.arg_ops[0]
+    mapped_byte = ctx[byte_arg]
+    if mapped_byte is None:
+        mapped_byte = byte_arg
+
+    elem_size = cir_type_size_in_bytes(pointee)
+    elem_ty = convert_cir_type_to_standard(pointee, program_state)
+    memref_ty = MemRefType(elem_ty, [DYNAMIC_INDEX])
+
+    # Convert byte count (i64 / iN) → index, divide by element size.
+    pre_ops: list[Operation] = []
+    byte_ty = mapped_byte.type
+    # If the byte count is already an index, skip the cast.
+    if isinstance(byte_ty, IndexType):
+        byte_idx = mapped_byte
+    else:
+        cast = arith.IndexCastOp(mapped_byte, IndexType())
+        pre_ops.append(cast)
+        byte_idx = cast.results[0]
+
+    if elem_size == 1:
+        nelems = byte_idx
+    else:
+        size_const = arith.ConstantOp(
+            IntegerAttr(elem_size, IndexType()), IndexType()
+        )
+        div = arith.DivUIOp(byte_idx, size_const.results[0])
+        pre_ops.append(size_const)
+        pre_ops.append(div)
+        nelems = div.results[0]
+
+    alloc = memref.AllocOp.get(
+        elem_ty,
+        shape=[DYNAMIC_INDEX],
+        dynamic_sizes=[nelems],
+    )
+    ctx[op.results[0]] = alloc.memref
+    # Also map the malloc call's result so any other defensive lookups
+    # don't end up with a None — chase-back through `_try_lower_malloc`
+    # consumers normally goes through the bitcast result, but this is
+    # cheap insurance.
+    ctx[src_owner.results[0]] = alloc.memref
+    return [*pre_ops, alloc]
 
 
 def _integral_cast(

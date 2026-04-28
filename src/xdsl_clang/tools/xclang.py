@@ -37,17 +37,16 @@ class OutputType(Enum):
     MLIR = 4
 
 
-# `use-bare-ptr-memref-call-conv=1` strips the memref descriptor at function
-# boundaries so we match the plain-C ABI of externs like `assert_check`.
-# bare-ptr cc on convert-func-to-llvm strips memref descriptors at function
-# boundaries so we match the C ABI. We run it before finalize-memref-to-llvm
-# so the function-boundary descriptors are erased before the rest of memref
-# is lowered.
+# Extern-function ABI is now handled at the cir-to-core level (Task 5.5):
+# extern decls take `!llvm.ptr` directly, and call sites bridge from
+# memref descriptors via `memref.extract_aligned_pointer_as_index` +
+# `arith.index_cast` + `llvm.inttoptr`. Internal functions keep the full
+# memref descriptor at boundaries.
 MLIR_PIPELINE = (
     "builtin.module(canonicalize,cse,loop-invariant-code-motion,"
     "convert-scf-to-cf,fold-memref-alias-ops,lower-affine,"
     "convert-arith-to-llvm{index-bitwidth=64},convert-math-to-llvm,"
-    "convert-func-to-llvm{use-bare-ptr-memref-call-conv=1},"
+    "convert-func-to-llvm,"
     "finalize-memref-to-llvm,"
     "convert-cf-to-llvm{index-bitwidth=64},"
     "reconcile-unrealized-casts)"

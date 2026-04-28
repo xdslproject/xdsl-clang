@@ -7,7 +7,7 @@ operand types and dispatches accordingly.
 
 from __future__ import annotations
 
-from xdsl.dialects import arith
+from xdsl.dialects import arith, llvm, memref
 from xdsl.dialects.builtin import (
     AnyFloat,
     Float32Type,
@@ -15,6 +15,10 @@ from xdsl.dialects.builtin import (
     FloatAttr,
     IntegerAttr,
     IntegerType,
+    MemRefType,
+    StringAttr,
+    UnitAttr,
+    UnrealizedConversionCastOp,
 )
 from xdsl.ir import Operation, SSAValue
 from xdsl.utils.hints import isa
@@ -23,6 +27,10 @@ from xdsl_clang.dialects import cir
 from xdsl_clang.transforms.cir_to_core.components.cir_types import (
     convert_cir_type_to_standard,
     signedness_of,
+)
+from xdsl_clang.transforms.cir_to_core.components.memory import (
+    const_array_to_dense,
+    zero_dense_for_type,
 )
 from xdsl_clang.transforms.cir_to_core.misc.c_code_description import ProgramState
 from xdsl_clang.transforms.cir_to_core.misc.ssa_context import SSAValueCtx
@@ -85,10 +93,45 @@ def translate_constant(
         const = arith.ConstantOp(FloatAttr(v, out_ty), out_ty)
         ctx[op.results[0]] = const.results[0]
         return [const]
+    if isa(attr, cir.ConstPtrAttr):
+        # Null-pointer constant (`int *p = NULL;`). The result type
+        # depends on Decision 1 — record/function/void* pointers lower to
+        # `!llvm.ptr`; scalar/decayed pointers lower to a memref.
+        #
+        # Loads/stores *through* a NULL pointer are UB in C and we don't
+        # model them. The SSA value still has to *exist*, however, so the
+        # surrounding `cir.store %null, %slot` typechecks against the
+        # parent slot's element type. For the memref case we therefore
+        # materialise a zero `!llvm.ptr` and `unrealized_conversion_cast`
+        # it to the target memref type — the cast leaves no runtime
+        # artefact (it's resolved away by `reconcile-unrealized-casts`)
+        # and the resulting memref is poison: dereferencing it is UB,
+        # which matches C's NULL-deref semantics exactly.
+        #
+        # We use the decayed (`memref<?xT>`) pointer convention so the
+        # result type matches the slot type that pointer-of-pointer
+        # `cir.alloca`s produce (see `translate_alloca`).
+        from xdsl_clang.transforms.cir_to_core.components.cir_types import (
+            DECAYED_PTR,
+        )
+
+        target_ty = convert_cir_type_to_standard(
+            attr.ptr_type, program_state, ptr_mode=DECAYED_PTR
+        )
+        zero = llvm.ZeroOp.build(result_types=[llvm.LLVMPointerType()])
+        if isinstance(target_ty, MemRefType):
+            cast = UnrealizedConversionCastOp.get(
+                [zero.results[0]], [target_ty]
+            )
+            ctx[op.results[0]] = cast.results[0]
+            return [zero, cast]
+        # `!llvm.ptr` directly — record / function / void* pointer.
+        ctx[op.results[0]] = zero.results[0]
+        return [zero]
     if isa(attr, cir.ZeroAttr):
-        # Scalar zero — emit `arith.constant 0`. Array/struct zeros at the
-        # function-local scope are deferred to Phase 5 (they require
-        # hoisting to a private memref.global + copy).
+        # Scalar zero — emit `arith.constant 0`. Array zeros at the
+        # function-local scope are hoisted to a private `memref.global`
+        # with a `dense<0>` initial value (Task 5.2).
         ty = op.results[0].type
         if isa(ty, cir.IntType) or isa(ty, cir.BoolType):
             out_ty = convert_cir_type_to_standard(ty, program_state)
@@ -101,13 +144,84 @@ def translate_constant(
             const = arith.ConstantOp(FloatAttr(0.0, out_ty), out_ty)
             ctx[op.results[0]] = const.results[0]
             return [const]
+        if isa(ty, cir.ArrayType):
+            return _hoist_zero_array_literal(program_state, ctx, op, ty)
         raise NotImplementedError(
             f"cir-to-core: function-local cir.const #cir.zero of type {ty} "
             f"(Phase 5 — needs constant hoisting)"
         )
+    if isa(attr, cir.ConstArrayAttr):
+        # Constant array literal — `float a[10] = {1, 2, …};`. Hoist the
+        # initialiser to a private `memref.global` and replace the
+        # `cir.const` with a `memref.get_global` (Task 5.2). The
+        # surrounding `cir.store %c, %slot` is fused into a `memref.copy`
+        # by `translate_store`.
+        ty = op.results[0].type
+        if isa(ty, cir.ArrayType):
+            return _hoist_const_array_literal(program_state, ctx, op, attr, ty)
+        raise NotImplementedError(
+            f"cir-to-core: cir.const #cir.const_array of non-array type {ty}"
+        )
     raise NotImplementedError(
         f"cir-to-core: unsupported constant attribute {type(attr).__name__}"
     )
+
+
+def _hoist_const_array_literal(
+    program_state: ProgramState,
+    ctx: SSAValueCtx,
+    op: cir.ConstantOp,
+    attr: cir.ConstArrayAttr,
+    array_ty: "cir.ArrayType",
+) -> list[Operation]:
+    """Hoist a `cir.const #cir.const_array` to a private `memref.global`.
+
+    The result of the original `cir.const` is replaced with a
+    `memref.get_global` returning a memref of the same shape. Subsequent
+    `cir.store` of the SSA value is recognised by `translate_store` and
+    fused into a `memref.copy`.
+    """
+    target_ty = convert_cir_type_to_standard(array_ty, program_state)
+    assert isinstance(target_ty, MemRefType)
+    dense = const_array_to_dense(program_state, attr, target_ty)
+    sym = program_state.fresh_literal_symbol()
+    global_op = memref.GlobalOp.get(
+        StringAttr(sym),
+        target_ty,
+        initial_value=dense,
+        sym_visibility=StringAttr("private"),
+        constant=UnitAttr(),
+    )
+    program_state.append_module_prelude_op(global_op)
+    get = memref.GetGlobalOp(sym, target_ty)
+    ctx[op.results[0]] = get.results[0]
+    return [get]
+
+
+def _hoist_zero_array_literal(
+    program_state: ProgramState,
+    ctx: SSAValueCtx,
+    op: cir.ConstantOp,
+    array_ty: "cir.ArrayType",
+) -> list[Operation]:
+    """Hoist a `cir.const #cir.zero : !cir.array<…>` to a zero-init
+    private `memref.global`.
+    """
+    target_ty = convert_cir_type_to_standard(array_ty, program_state)
+    assert isinstance(target_ty, MemRefType)
+    dense = zero_dense_for_type(target_ty)
+    sym = program_state.fresh_literal_symbol()
+    global_op = memref.GlobalOp.get(
+        StringAttr(sym),
+        target_ty,
+        initial_value=dense,
+        sym_visibility=StringAttr("private"),
+        constant=UnitAttr(),
+    )
+    program_state.append_module_prelude_op(global_op)
+    get = memref.GetGlobalOp(sym, target_ty)
+    ctx[op.results[0]] = get.results[0]
+    return [get]
 
 
 # ---------------------------------------------------------------------------

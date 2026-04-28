@@ -80,6 +80,12 @@ class GatherFunctionInformation(Visitor):
 
     def traverse_func_op(self, op: cir.FuncOp) -> None:
         fn_name = op.sym_name.data
+        # `malloc` / `free` are pattern-matched by `translate_cast` /
+        # `translate_call` and lowered to `memref.alloc` / `memref.dealloc`
+        # — we never want to emit `func.func` declarations for them, so
+        # skip them entirely from the function table. See Phase 5 Task 5.4.
+        if fn_name in ("malloc", "free"):
+            return
         return_type = op.function_type.return_type
         if isa(return_type, cir.VoidType):
             return_type_for_def = None
@@ -143,6 +149,19 @@ def translate_program(
         # represented by CIR ops we haven't catalogued yet).
         for new in statements.translate_stmt(program_state, global_ctx, op):
             body_block.add_op(new)
+
+    # Splice any prelude ops (e.g. hoisted `memref.global`s for
+    # function-local constant arrays — Task 5.2) into the front of the
+    # lowered module body so they appear at module scope before any
+    # function that references them.
+    if program_state.module_prelude_ops:
+        existing_ops = list(body_block.ops)
+        for op in existing_ops:
+            op.detach()
+        for prelude_op in program_state.module_prelude_ops:
+            body_block.add_op(prelude_op)
+        for op in existing_ops:
+            body_block.add_op(op)
     return builtin.ModuleOp(Region([body_block]))
 
 

@@ -166,18 +166,18 @@ def _const_ops_for_init(
     if isa(attr, cir.ZeroAttr):
         # `#cir.zero` for an array type — emit a zero memref initial value.
         # Caller will detect this via the second return value.
-        return [], _zero_dense_for_type(target_ty)
+        return [], zero_dense_for_type(target_ty)
     if isa(attr, cir.ConstArrayAttr):
         # Materialise as a DenseElementsAttr if possible — only legal for
         # element-wise scalar constants of uniform type.
-        dense = _const_array_to_dense(program_state, attr, target_ty)
+        dense = const_array_to_dense(program_state, attr, target_ty)
         return [], dense
     raise NotImplementedError(
         f"cir-to-core: unsupported global initialiser {type(attr).__name__}"
     )
 
 
-def _zero_dense_for_type(target_ty: Attribute) -> Attribute:
+def zero_dense_for_type(target_ty: Attribute) -> Attribute:
     if isinstance(target_ty, MemRefType):
         elem = target_ty.get_element_type()
         if isinstance(elem, IntegerType):
@@ -188,7 +188,7 @@ def _zero_dense_for_type(target_ty: Attribute) -> Attribute:
             raise NotImplementedError(
                 f"cir-to-core: can't zero-init memref of {elem}"
             )
-        from xdsl.dialects.builtin import RankedTensorType, TensorType
+        from xdsl.dialects.builtin import TensorType
 
         # memref.global accepts a tensor splat as its initial_value.
         tensor_ty = TensorType(elem, list(target_ty.get_shape()))
@@ -196,7 +196,7 @@ def _zero_dense_for_type(target_ty: Attribute) -> Attribute:
     raise NotImplementedError("cir-to-core: zero-init unsupported here")
 
 
-def _const_array_to_dense(
+def const_array_to_dense(
     program_state: ProgramState, attr: cir.ConstArrayAttr, target_ty: Attribute
 ) -> Attribute:
     if not isinstance(target_ty, MemRefType):
@@ -300,7 +300,7 @@ def translate_global(
                 tensor_ty, [attr.value.value.data]
             )
         elif isa(attr, cir.ConstArrayAttr):
-            init_attr = _const_array_to_dense(program_state, attr, target_ty)
+            init_attr = const_array_to_dense(program_state, attr, target_ty)
         elif isa(attr, cir.ConstPtrAttr):
             # NULL-initialised pointer global. Treat as zero-init at the
             # memref level — this means the pointer slot starts as a

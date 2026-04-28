@@ -1,0 +1,63 @@
+// RUN: xdsl-opt -p cir-to-core %s 2>&1 | filecheck %s
+
+// Phase 5 Task 5.5: extern-function ABI without bare-ptr cc.
+//
+// Pointer args on extern declarations lower directly to `!llvm.ptr` so they
+// match the plain-C ABI. Internal functions keep the memref-descriptor
+// convention; call sites bridge from `memref<…>` to `!llvm.ptr` via
+// `memref.extract_aligned_pointer_as_index` + `arith.index_cast` +
+// `llvm.inttoptr`. Internal-function call sites are unaffected.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+
+module {
+  // Extern decl with a `!cir.ptr<!s8i>` arg: lowers to `!llvm.ptr` — not
+  // `memref<?xi8>` — so it matches `int assert_check(const char*)`.
+  cir.func @assert_check(!cir.ptr<!s8i>) -> !s32i
+
+  // CHECK:      func.func private @assert_check(!llvm.ptr) -> i32
+
+  // Internal function with the usual decayed-pointer arg convention:
+  // `memref<?xi8>` at the boundary, bridged to `!llvm.ptr` at the extern
+  // call site.
+  cir.func @run(%p: !cir.ptr<!s8i>) -> !s32i {
+    %r = cir.call @assert_check(%p) : (!cir.ptr<!s8i>) -> !s32i
+    cir.return %r : !s32i
+  }
+  // CHECK:      func.func @run(%[[P:.*]]: memref<?xi8>) -> i32 {
+  // CHECK-NEXT:   %[[I:.*]] = "memref.extract_aligned_pointer_as_index"(%[[P]]) : (memref<?xi8>) -> index
+  // CHECK-NEXT:   %[[I64:.*]] = arith.index_cast %[[I]] : index to i64
+  // CHECK-NEXT:   %[[PTR:.*]] = llvm.inttoptr %[[I64]] : i64 to !llvm.ptr
+  // CHECK-NEXT:   %[[R:.*]] = func.call @assert_check(%[[PTR]]) : (!llvm.ptr) -> i32
+
+  // Stack array decayed to `!cir.ptr<!s8i>` and passed to the extern: the
+  // `memref.cast` to dynamic shape happens, then the same bridge.
+  cir.func @run_local() -> !s32i {
+    %a = cir.alloca !cir.array<!s8i x 16>, !cir.ptr<!cir.array<!s8i x 16>>, ["buf"] {alignment = 1 : i64}
+    %d = cir.cast array_to_ptrdecay %a : !cir.ptr<!cir.array<!s8i x 16>> -> !cir.ptr<!s8i>
+    %r = cir.call @assert_check(%d) : (!cir.ptr<!s8i>) -> !s32i
+    cir.return %r : !s32i
+  }
+  // CHECK:      func.func @run_local() -> i32 {
+  // CHECK-NEXT:   %[[A:.*]] = memref.alloca() : memref<16xi8>
+  // CHECK-NEXT:   %[[C:.*]] = "memref.cast"(%[[A]]) : (memref<16xi8>) -> memref<?xi8>
+  // CHECK-NEXT:   %[[I2:.*]] = "memref.extract_aligned_pointer_as_index"(%[[C]]) : (memref<?xi8>) -> index
+  // CHECK-NEXT:   %[[I642:.*]] = arith.index_cast %[[I2]] : index to i64
+  // CHECK-NEXT:   %[[PTR2:.*]] = llvm.inttoptr %[[I642]] : i64 to !llvm.ptr
+  // CHECK-NEXT:   %{{.*}} = func.call @assert_check(%[[PTR2]]) : (!llvm.ptr) -> i32
+
+  // Internal-function call site: no bridging; memref descriptor flows
+  // through unchanged.
+  cir.func @internal_callee(%p: !cir.ptr<!s8i>) -> !s32i {
+    %z = cir.const #cir.int<0> : !s32i
+    cir.return %z : !s32i
+  }
+
+  cir.func @caller(%p: !cir.ptr<!s8i>) -> !s32i {
+    %r = cir.call @internal_callee(%p) : (!cir.ptr<!s8i>) -> !s32i
+    cir.return %r : !s32i
+  }
+  // CHECK:      func.func @caller(%[[P3:.*]]: memref<?xi8>) -> i32 {
+  // CHECK-NEXT:   %[[R3:.*]] = func.call @internal_callee(%[[P3]]) : (memref<?xi8>) -> i32
+}
