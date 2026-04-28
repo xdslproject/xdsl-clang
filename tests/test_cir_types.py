@@ -16,7 +16,7 @@ from __future__ import annotations
 from xdsl.dialects import builtin, llvm
 from xdsl.dialects.builtin import DYNAMIC_INDEX
 
-import xdsl_clang  # noqa: F401  (registers cir-compat patches)
+import xdsl_clang  # noqa: F401  (registers cir-compat patches)  # pyright: ignore[reportUnusedImport]
 from xdsl_clang.dialects import cir
 from xdsl_clang.transforms.cir_to_core.components.cir_types import (
     DECAYED_PTR,
@@ -76,9 +76,7 @@ def test_pointer_to_array_unwraps_to_static_memref():
     # ptr<array<i8 x 25>> always lowers to memref<25xi8>; the array carries
     # the length so we don't need the dynamic memref form.
     u8 = cir.IntType(8, False)
-    out = convert_cir_type_to_standard(
-        cir.PointerType(cir.ArrayType(u8, 25)), _ps()
-    )
+    out = convert_cir_type_to_standard(cir.PointerType(cir.ArrayType(u8, 25)), _ps())
     assert out == builtin.MemRefType(builtin.IntegerType(8), [25])
 
 
@@ -88,9 +86,7 @@ def test_void_pointer_is_opaque():
 
 
 def test_record_pointer_is_opaque():
-    rec = cir.RecordType(
-        [cir.IntType(32, True), cir.DoubleType()], record_name="P"
-    )
+    rec = cir.RecordType([cir.IntType(32, True), cir.DoubleType()], record_name="P")
     out = convert_cir_type_to_standard(cir.PointerType(rec), _ps(), ptr_mode=SCALAR_PTR)
     assert isinstance(out, llvm.LLVMPointerType)
 
@@ -105,9 +101,7 @@ def test_function_pointer_is_opaque():
 
 
 def test_record_maps_to_llvm_struct():
-    rec = cir.RecordType(
-        [cir.IntType(32, True), cir.DoubleType()], record_name="Pair"
-    )
+    rec = cir.RecordType([cir.IntType(32, True), cir.DoubleType()], record_name="Pair")
     out = convert_cir_type_to_standard(rec, _ps())
     expected = llvm.LLVMStructType.from_type_list(
         [builtin.IntegerType(32), builtin.Float64Type()]

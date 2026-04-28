@@ -18,8 +18,8 @@ per Decision 3 / `structs.md`.
 from __future__ import annotations
 
 from xdsl.dialects import arith, llvm, memref
-from xdsl.dialects.builtin import IndexType, IntegerAttr, IntegerType, MemRefType
-from xdsl.ir import Operation, SSAValue
+from xdsl.dialects.builtin import IndexType, IntegerAttr, MemRefType
+from xdsl.ir import Attribute, Operation, SSAValue
 from xdsl.utils.hints import isa
 
 from xdsl_clang.dialects import cir
@@ -28,7 +28,6 @@ from xdsl_clang.transforms.cir_to_core.components.cir_types import (
 )
 from xdsl_clang.transforms.cir_to_core.misc.c_code_description import ProgramState
 from xdsl_clang.transforms.cir_to_core.misc.ssa_context import SSAValueCtx
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -153,8 +152,8 @@ def translate_store(
     # `memref.store` cannot store a whole memref, so emit `memref.copy`
     # from the source memref into the destination memref.
     if (
-        isinstance(val.type, MemRefType)
-        and isinstance(addr.type, MemRefType)
+        isa(val.type, MemRefType[Attribute])
+        and isa(addr.type, MemRefType[Attribute])
         and val.type.get_shape() == addr.type.get_shape()
         and val.type.get_element_type() == addr.type.get_element_type()
     ):
@@ -233,9 +232,7 @@ def translate_get_member(
     # Determine the element type of the surrounding pointer for GEP.
     pointee = op.addr.type.pointee  # type: ignore[attr-defined]
     if not isa(pointee, cir.RecordType):
-        raise NotImplementedError(
-            "cir-to-core: cir.get_member on non-record pointer"
-        )
+        raise NotImplementedError("cir-to-core: cir.get_member on non-record pointer")
     elem = convert_cir_type_to_standard(pointee, program_state)
     field_idx = op.index_attr.value.data
     gep = llvm.GEPOp(

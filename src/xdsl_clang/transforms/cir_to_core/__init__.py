@@ -35,7 +35,6 @@ from xdsl_clang.transforms.cir_to_core.misc.c_code_description import (
 from xdsl_clang.transforms.cir_to_core.misc.ssa_context import SSAValueCtx
 from xdsl_clang.transforms.cir_to_core.misc.visitor import Visitor
 
-
 # ---------------------------------------------------------------------------
 # Gather visitors
 # ---------------------------------------------------------------------------
@@ -71,9 +70,7 @@ class GatherFunctionInformation(Visitor):
             # carried in the dialect. The frontend addresses fields by index
             # (`cir.get_member %p[<idx>]`) so we mint synthetic field names
             # `f0`, `f1`, … that match the GEP indices used downstream.
-            layout.fields.append(
-                FieldDef(name=f"f{idx}", index=idx, cir_type=member)
-            )
+            layout.fields.append(FieldDef(name=f"f{idx}", index=idx, cir_type=member))
             if isa(member, cir.RecordType):
                 self._ensure_record_layout(member)
         self.program_state.record_layouts[name] = layout

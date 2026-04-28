@@ -13,7 +13,6 @@ from typing import Any
 
 from xdsl.ir import Operation
 
-
 _CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")
 
 

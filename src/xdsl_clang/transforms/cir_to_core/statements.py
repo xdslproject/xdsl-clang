@@ -19,9 +19,7 @@ def translate_stmt(
 ) -> list[Operation]:
     ops = try_translate_stmt(program_state, ctx, op)
     if ops is None:
-        raise NotImplementedError(
-            f"cir-to-core: no statement handler for {op.name}"
-        )
+        raise NotImplementedError(f"cir-to-core: no statement handler for {op.name}")
     return ops
 
 
@@ -33,8 +31,14 @@ def try_translate_stmt(
     from xdsl_clang.transforms.cir_to_core import expressions
     from xdsl_clang.transforms.cir_to_core.components import (
         control_flow as cir_ctrl,
+    )
+    from xdsl_clang.transforms.cir_to_core.components import (
         functions as cir_functions,
+    )
+    from xdsl_clang.transforms.cir_to_core.components import (
         load_store as cir_load_store,
+    )
+    from xdsl_clang.transforms.cir_to_core.components import (
         memory as cir_memory,
     )
 

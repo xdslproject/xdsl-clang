@@ -190,9 +190,7 @@ def _translate_if_unstructured(
     # break/continue/return).
     fn_state.current_block = then_block
     fn_state.block_terminated = False
-    _translate_region_into_block_unstructured(
-        program_state, ctx, op.then_region
-    )
+    _translate_region_into_block_unstructured(program_state, ctx, op.then_region)
     if not fn_state.block_terminated:
         assert fn_state.current_block is not None
         fn_state.current_block.add_op(cf.BranchOp(merge_block))
@@ -200,9 +198,7 @@ def _translate_if_unstructured(
     if else_block is not None:
         fn_state.current_block = else_block
         fn_state.block_terminated = False
-        _translate_region_into_block_unstructured(
-            program_state, ctx, op.else_region
-        )
+        _translate_region_into_block_unstructured(program_state, ctx, op.else_region)
         if not fn_state.block_terminated:
             assert fn_state.current_block is not None
             fn_state.current_block.add_op(cf.BranchOp(merge_block))
@@ -230,6 +226,7 @@ def translate_scope(
     unstructured = fn_state is not None and fn_state.is_unstructured
 
     if unstructured:
+        assert fn_state is not None
         # Append children straight into `current_block` so any nested
         # unstructured loop / cir.if-with-break can splice fresh blocks in
         # and update the cursor without our outer collection getting
@@ -248,9 +245,7 @@ def translate_scope(
                         mapped = inner_ctx[ssa]
                         ctx[old_res] = mapped if mapped is not None else ssa
                 continue
-            for new_op in statements.translate_stmt(
-                program_state, inner_ctx, body_op
-            ):
+            for new_op in statements.translate_stmt(program_state, inner_ctx, body_op):
                 if fn_state.current_block is None:
                     raise RuntimeError(
                         "cir-to-core: current_block became None inside cir.scope"
@@ -376,9 +371,7 @@ def translate_for(
 def translate_while(
     program_state: ProgramState, ctx: SSAValueCtx, op: cir.WhileOp
 ) -> list[Operation]:
-    return _build_while_loop(
-        program_state, ctx, op.cond_region, op.body_region
-    )
+    return _build_while_loop(program_state, ctx, op.cond_region, op.body_region)
 
 
 def translate_dowhile(
@@ -444,9 +437,7 @@ def _build_unstructured_loop(
     `cir.continue` branches to `^step` (for) or `^header` (while).
     """
     if body_first:
-        raise NotImplementedError(
-            "cir-to-core: cir.do unstructured emitter (Task 5.8)"
-        )
+        raise NotImplementedError("cir-to-core: cir.do unstructured emitter (Task 5.8)")
 
     fn_state = program_state.getCurrentFnState()
     if not fn_state.is_unstructured:
@@ -478,9 +469,7 @@ def _build_unstructured_loop(
     fn_state.block_terminated = False
     cond_ctx = SSAValueCtx(parent_scope=ctx)
     _translate_region_into_block_unstructured(program_state, cond_ctx, cond_region)
-    cond_term = (
-        list(cond_region.block.ops)[-1] if cond_region.block.ops else None
-    )
+    cond_term = list(cond_region.block.ops)[-1] if cond_region.block.ops else None
     if cond_term is None or not isa(cond_term, cir.ConditionOp):
         raise NotImplementedError(
             "cir-to-core: malformed loop cond region (no cir.condition terminator)"
@@ -488,7 +477,7 @@ def _build_unstructured_loop(
     cond_val = cond_ctx[cond_term.cond]
     if cond_val is None:
         cond_val = cond_term.cond
-    if fn_state.current_block is None:
+    if fn_state.current_block is None:  # type: ignore[reportUnnecessaryComparison]
         raise RuntimeError(
             "cir-to-core: cond region nulled current_block in loop emitter"
         )
@@ -504,9 +493,7 @@ def _build_unstructured_loop(
         fn_state.current_block = body
         fn_state.block_terminated = False
         body_ctx = SSAValueCtx(parent_scope=ctx)
-        _translate_region_into_block_unstructured(
-            program_state, body_ctx, body_region
-        )
+        _translate_region_into_block_unstructured(program_state, body_ctx, body_region)
         if not fn_state.block_terminated:
             assert fn_state.current_block is not None
             fn_state.current_block.add_op(cf.BranchOp(latch))
@@ -520,9 +507,7 @@ def _build_unstructured_loop(
         fn_state.block_terminated = False
         step_ctx = SSAValueCtx(parent_scope=ctx)
         assert step_region is not None
-        _translate_region_into_block_unstructured(
-            program_state, step_ctx, step_region
-        )
+        _translate_region_into_block_unstructured(program_state, step_ctx, step_region)
         if not fn_state.block_terminated:
             assert fn_state.current_block is not None
             fn_state.current_block.add_op(cf.BranchOp(header))
@@ -633,9 +618,7 @@ def translate_brcond(
     else_block = _lookup_block(program_state, op.successor[1])
     then_args = _resolve_args(ctx, list(op.dest_operands_true))
     else_args = _resolve_args(ctx, list(op.dest_operands_false))
-    return [
-        cf.ConditionalBranchOp(cond, then_block, then_args, else_block, else_args)
-    ]
+    return [cf.ConditionalBranchOp(cond, then_block, then_args, else_block, else_args)]
 
 
 def translate_ternary(
@@ -657,7 +640,8 @@ def translate_ternary(
 
     lowered_ty = convert_cir_type_to_standard(res_ty, program_state)
 
-    cond = ctx[op.cond] if ctx[op.cond] is not None else op.cond
+    mapped_cond = ctx[op.cond]
+    cond = mapped_cond if mapped_cond is not None else op.cond
 
     def _build_branch(region: Region) -> Block:
         block = Block()

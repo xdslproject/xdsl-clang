@@ -25,7 +25,6 @@ from xdsl.utils.hints import isa
 from xdsl_clang.dialects import cir
 from xdsl_clang.transforms.cir_to_core.misc.c_code_description import ProgramState
 
-
 # ---------------------------------------------------------------------------
 # Pointer-mode tracking — Decision 1
 # ---------------------------------------------------------------------------
@@ -120,9 +119,7 @@ def _convert_pointer(
     return builtin.MemRefType(elem, [])  # memref<T>
 
 
-def _convert_record(
-    rec: cir.RecordType, program_state: ProgramState
-) -> Attribute:
+def _convert_record(rec: cir.RecordType, program_state: ProgramState) -> Attribute:
     """`!cir.record<…>` → `!llvm.struct<(…)>`."""
     field_types: list[Attribute] = []
     for member in rec.members.data:
@@ -169,9 +166,7 @@ def cir_type_size_in_bytes(cir_type: Attribute) -> int:
     if isa(cir_type, cir.PointerType):
         # 64-bit target.
         return 8
-    raise NotImplementedError(
-        f"cir_type_size_in_bytes: unsupported type {cir_type}"
-    )
+    raise NotImplementedError(f"cir_type_size_in_bytes: unsupported type {cir_type}")
 
 
 def signedness_of(value: SSAValue) -> bool | None:

@@ -10,17 +10,16 @@ from __future__ import annotations
 from xdsl.dialects import arith, llvm, memref
 from xdsl.dialects.builtin import (
     AnyFloat,
-    Float32Type,
-    Float64Type,
     FloatAttr,
     IntegerAttr,
     IntegerType,
     MemRefType,
+    Signedness,
     StringAttr,
     UnitAttr,
     UnrealizedConversionCastOp,
 )
-from xdsl.ir import Operation, SSAValue
+from xdsl.ir import Attribute, Operation, SSAValue
 from xdsl.utils.hints import isa
 
 from xdsl_clang.dialects import cir
@@ -35,6 +34,7 @@ from xdsl_clang.transforms.cir_to_core.components.memory import (
 from xdsl_clang.transforms.cir_to_core.misc.c_code_description import ProgramState
 from xdsl_clang.transforms.cir_to_core.misc.ssa_context import SSAValueCtx
 
+_AnyIntegerType = IntegerType[int, Signedness]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -75,6 +75,7 @@ def translate_constant(
     attr = op.value
     if isa(attr, cir.CIRIntAttr):
         out_ty = convert_cir_type_to_standard(attr.int_type, program_state)
+        assert isa(out_ty, _AnyIntegerType)
         # CIRIntAttr stores the raw bit-pattern as an i64; re-wrap it at the
         # target width.
         v = attr.value.value.data
@@ -119,10 +120,8 @@ def translate_constant(
             attr.ptr_type, program_state, ptr_mode=DECAYED_PTR
         )
         zero = llvm.ZeroOp.build(result_types=[llvm.LLVMPointerType()])
-        if isinstance(target_ty, MemRefType):
-            cast = UnrealizedConversionCastOp.get(
-                [zero.results[0]], [target_ty]
-            )
+        if isa(target_ty, MemRefType[Attribute]):
+            cast = UnrealizedConversionCastOp.get([zero.results[0]], [target_ty])
             ctx[op.results[0]] = cast.results[0]
             return [zero, cast]
         # `!llvm.ptr` directly — record / function / void* pointer.
@@ -135,6 +134,7 @@ def translate_constant(
         ty = op.results[0].type
         if isa(ty, cir.IntType) or isa(ty, cir.BoolType):
             out_ty = convert_cir_type_to_standard(ty, program_state)
+            assert isa(out_ty, _AnyIntegerType)
             const = arith.ConstantOp(IntegerAttr(0, out_ty), out_ty)
             ctx[op.results[0]] = const.results[0]
             return [const]
@@ -172,7 +172,7 @@ def _hoist_const_array_literal(
     ctx: SSAValueCtx,
     op: cir.ConstantOp,
     attr: cir.ConstArrayAttr,
-    array_ty: "cir.ArrayType",
+    array_ty: cir.ArrayType,
 ) -> list[Operation]:
     """Hoist a `cir.const #cir.const_array` to a private `memref.global`.
 
@@ -182,7 +182,7 @@ def _hoist_const_array_literal(
     fused into a `memref.copy`.
     """
     target_ty = convert_cir_type_to_standard(array_ty, program_state)
-    assert isinstance(target_ty, MemRefType)
+    assert isa(target_ty, MemRefType[Attribute])
     dense = const_array_to_dense(program_state, attr, target_ty)
     sym = program_state.fresh_literal_symbol()
     global_op = memref.GlobalOp.get(
@@ -202,13 +202,13 @@ def _hoist_zero_array_literal(
     program_state: ProgramState,
     ctx: SSAValueCtx,
     op: cir.ConstantOp,
-    array_ty: "cir.ArrayType",
+    array_ty: cir.ArrayType,
 ) -> list[Operation]:
     """Hoist a `cir.const #cir.zero : !cir.array<…>` to a zero-init
     private `memref.global`.
     """
     target_ty = convert_cir_type_to_standard(array_ty, program_state)
-    assert isinstance(target_ty, MemRefType)
+    assert isa(target_ty, MemRefType[Attribute])
     dense = zero_dense_for_type(target_ty)
     sym = program_state.fresh_literal_symbol()
     global_op = memref.GlobalOp.get(
@@ -289,9 +289,7 @@ def translate_binop(
             )
         new_op = cls_f(lhs, rhs)
     else:
-        raise NotImplementedError(
-            f"cir-to-core: binop on type {op.lhs.type}"
-        )
+        raise NotImplementedError(f"cir-to-core: binop on type {op.lhs.type}")
     ctx[op.results[0]] = new_op.results[0]
     return [new_op]
 
@@ -350,6 +348,7 @@ def translate_unary(
 
     if kind == "minus":
         if _is_int(op.input):
+            assert isa(src.type, _AnyIntegerType)
             zero = arith.ConstantOp(IntegerAttr(0, src.type), src.type)
             sub = arith.SubiOp(zero.results[0], src)
             ctx[op.results[0]] = sub.results[0]
@@ -363,6 +362,7 @@ def translate_unary(
         # Bitwise complement on integers, logical-not on bool — both the
         # same i1/iN xor-with-all-ones in MLIR.
         if _is_int(op.input):
+            assert isa(src.type, _AnyIntegerType)
             ones = arith.ConstantOp(IntegerAttr(-1, src.type), src.type)
             xorop = arith.XOrIOp(src, ones.results[0])
             ctx[op.results[0]] = xorop.results[0]
@@ -372,6 +372,7 @@ def translate_unary(
         # Pre-/post-increment of a value (the address-update happens via a
         # surrounding load+store sequence in CIR).
         if _is_int(op.input):
+            assert isa(src.type, _AnyIntegerType)
             one = arith.ConstantOp(IntegerAttr(1, src.type), src.type)
             cls = arith.AddiOp if kind == "inc" else arith.SubiOp
             new = cls(src, one.results[0])

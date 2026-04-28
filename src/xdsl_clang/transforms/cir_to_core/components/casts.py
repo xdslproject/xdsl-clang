@@ -17,16 +17,18 @@ from __future__ import annotations
 
 from xdsl.dialects import arith, memref
 from xdsl.dialects.builtin import (
-    AnyFloat,
     DYNAMIC_INDEX,
+    AnyFloat,
     Float32Type,
     Float64Type,
+    FloatAttr,
     IndexType,
     IntegerAttr,
     IntegerType,
     MemRefType,
+    Signedness,
 )
-from xdsl.ir import Operation, SSAValue
+from xdsl.ir import Attribute, Operation, SSAValue
 from xdsl.utils.hints import isa
 
 from xdsl_clang.dialects import cir
@@ -37,6 +39,8 @@ from xdsl_clang.transforms.cir_to_core.components.cir_types import (
 )
 from xdsl_clang.transforms.cir_to_core.misc.c_code_description import ProgramState
 from xdsl_clang.transforms.cir_to_core.misc.ssa_context import SSAValueCtx
+
+_AnyIntegerType = IntegerType[int, Signedness]
 
 
 def translate_cast(
@@ -63,7 +67,7 @@ def translate_cast(
             dst_cir_ty, program_state, ptr_mode=DECAYED_PTR
         )
         src_ty = src.type
-        if isinstance(src_ty, MemRefType) and isinstance(decay_ty, MemRefType):
+        if isa(src_ty, MemRefType[Attribute]) and isa(decay_ty, MemRefType[Attribute]):
             if list(src_ty.get_shape()) != list(decay_ty.get_shape()):
                 cst = memref.CastOp.get(src, decay_ty)
                 ctx[op.results[0]] = cst.results[0]
@@ -96,14 +100,13 @@ def translate_cast(
         return []
 
     if kind == "int_to_bool":
+        assert isa(src.type, _AnyIntegerType)
         zero = arith.ConstantOp(_int_zero_attr(src.type), src.type)
         cmp = arith.CmpiOp(src, zero.results[0], 1)  # ne
         ctx[op.results[0]] = cmp.results[0]
         return [zero, cmp]
 
     if kind == "float_to_bool":
-        from xdsl.dialects.builtin import FloatAttr
-
         assert isinstance(src.type, AnyFloat)
         zero = arith.ConstantOp(FloatAttr(0.0, src.type), src.type)
         # cmpf "une" (unordered or not equal) ≈ "non-zero".
@@ -112,6 +115,7 @@ def translate_cast(
         return [zero, cmp]
 
     if kind == "bool_to_int":
+        assert isa(dst_ty, _AnyIntegerType)
         new = arith.ExtUIOp(src, dst_ty)
         ctx[op.results[0]] = new.results[0]
         return [new]
@@ -125,6 +129,7 @@ def translate_cast(
 
     if kind in ("int_to_float", "int_to_float_legacy"):
         # signed → sitofp, unsigned → uitofp
+        assert isinstance(dst_ty, AnyFloat)
         signed = signedness_of(op.src)
         cls = arith.SIToFPOp if (signed is None or signed) else arith.UIToFPOp
         new = cls(src, dst_ty)
@@ -132,6 +137,7 @@ def translate_cast(
         return [new]
 
     if kind in ("float_to_int", "floating_to_int"):
+        assert isa(dst_ty, _AnyIntegerType)
         signed = signedness_of(op.results[0])
         cls = arith.FPToSIOp if (signed is None or signed) else arith.FPToUIOp
         new = cls(src, dst_ty)
@@ -141,13 +147,11 @@ def translate_cast(
     raise NotImplementedError(f"cir-to-core: unsupported cast kind {kind!r}")
 
 
-def _int_zero_attr(ty):
-    from xdsl.dialects.builtin import IntegerAttr
-
+def _int_zero_attr(ty: _AnyIntegerType) -> IntegerAttr[_AnyIntegerType]:
     return IntegerAttr(0, ty)
 
 
-def _is_void_ptr(ty) -> bool:
+def _is_void_ptr(ty: Attribute) -> bool:
     return isa(ty, cir.PointerType) and isa(ty.pointee, cir.VoidType)
 
 
@@ -196,8 +200,10 @@ def _try_lower_malloc_bitcast(
     # Records / functions / nested void* aren't sensible malloc targets
     # in the corpus — bail to the default and let the existing cast logic
     # handle them.
-    if isa(pointee, cir.RecordType) or isa(pointee, cir.FuncType) or isa(
-        pointee, cir.VoidType
+    if (
+        isa(pointee, cir.RecordType)
+        or isa(pointee, cir.FuncType)
+        or isa(pointee, cir.VoidType)
     ):
         return None
 
@@ -247,7 +253,6 @@ def _try_lower_malloc_bitcast(
 
     elem_size = cir_type_size_in_bytes(pointee)
     elem_ty = convert_cir_type_to_standard(pointee, program_state)
-    memref_ty = MemRefType(elem_ty, [DYNAMIC_INDEX])
 
     # Convert byte count (i64 / iN) → index, divide by element size.
     byte_ty = mapped_byte.type
@@ -262,9 +267,7 @@ def _try_lower_malloc_bitcast(
     if elem_size == 1:
         nelems = byte_idx
     else:
-        size_const = arith.ConstantOp(
-            IntegerAttr(elem_size, IndexType()), IndexType()
-        )
+        size_const = arith.ConstantOp(IntegerAttr(elem_size, IndexType()), IndexType())
         div = arith.DivUIOp(byte_idx, size_const.results[0])
         pre_ops.append(size_const)
         pre_ops.append(div)
@@ -287,17 +290,19 @@ def _try_lower_malloc_bitcast(
 def _integral_cast(
     src: SSAValue,
     op: cir.CastOp,
-    dst_ty,
+    dst_ty: Attribute,
     ctx: SSAValueCtx,
-    src_cir_ty,
+    src_cir_ty: Attribute,
 ) -> list[Operation]:
-    src_w = src.type.width.data  # type: ignore[attr-defined]
-    dst_w = dst_ty.width.data  # type: ignore[attr-defined]
+    assert isa(src.type, _AnyIntegerType)
+    assert isa(dst_ty, _AnyIntegerType)
+    src_w = src.type.width.data
+    dst_w = dst_ty.width.data
     if dst_w == src_w:
         ctx[op.results[0]] = src
         return []
     if dst_w < src_w:
-        new = arith.TrunciOp(src, dst_ty)
+        new: Operation = arith.TruncIOp(src, dst_ty)
     else:
         # Widening: pick signed vs unsigned by source signedness.
         signed = signedness_of(op.src)
@@ -308,10 +313,11 @@ def _integral_cast(
 
 
 def _float_resize(
-    src: SSAValue, dst_ty, ctx: SSAValueCtx, op: cir.CastOp
+    src: SSAValue, dst_ty: Attribute, ctx: SSAValueCtx, op: cir.CastOp
 ) -> list[Operation]:
     src_ty = src.type
-    assert isinstance(src_ty, AnyFloat) and isinstance(dst_ty, AnyFloat)
+    assert isinstance(src_ty, AnyFloat)
+    assert isinstance(dst_ty, AnyFloat)
     src_bits = _float_bits(src_ty)
     dst_bits = _float_bits(dst_ty)
     if dst_bits == src_bits:

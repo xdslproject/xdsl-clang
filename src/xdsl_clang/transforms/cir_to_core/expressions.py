@@ -43,10 +43,20 @@ def try_translate_expr(
     from xdsl_clang.dialects import cir
     from xdsl_clang.transforms.cir_to_core.components import (
         casts as cir_casts,
+    )
+    from xdsl_clang.transforms.cir_to_core.components import (
         control_flow as cir_ctrl,
+    )
+    from xdsl_clang.transforms.cir_to_core.components import (
         functions as cir_functions,
+    )
+    from xdsl_clang.transforms.cir_to_core.components import (
         load_store as cir_load_store,
+    )
+    from xdsl_clang.transforms.cir_to_core.components import (
         maths as cir_maths,
+    )
+    from xdsl_clang.transforms.cir_to_core.components import (
         memory as cir_memory,
     )
 

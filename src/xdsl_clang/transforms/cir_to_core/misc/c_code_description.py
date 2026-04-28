@@ -26,7 +26,7 @@ class FieldDef:
 
     name: str
     index: int
-    cir_type: "Attribute"
+    cir_type: Attribute
 
 
 @dataclass
@@ -48,7 +48,7 @@ class ArgumentDefinition:
     """One formal parameter of a CIR function."""
 
     name: str
-    cir_type: "Attribute"
+    cir_type: Attribute
     # `True` for plain scalars, `False` for pointer/array decayed args.
     is_scalar: bool
 
@@ -58,12 +58,10 @@ class FunctionDefinition:
     """Resolved metadata for a single ``cir.func``."""
 
     name: str
-    return_type: "Attribute | None"
+    return_type: Attribute | None
     is_definition_only: bool
     is_var_arg: bool = False
-    args: list[ArgumentDefinition] = field(
-        default_factory=list[ArgumentDefinition]
-    )
+    args: list[ArgumentDefinition] = field(default_factory=list[ArgumentDefinition])
 
     def add_arg_def(self, arg_def: ArgumentDefinition) -> None:
         self.args.append(arg_def)
@@ -74,8 +72,8 @@ class GlobalCIRComponent:
     """One ``cir.global`` (constant or otherwise) gathered up front."""
 
     sym_name: str
-    cir_type: "Attribute"
-    cir_op: "Operation"
+    cir_type: Attribute
+    cir_op: Operation
 
 
 @dataclass
@@ -109,10 +107,10 @@ class ComponentState:
     #     received a terminator (cf.br / cf.cond_br / func.return) so the
     #     driver should drop any remaining (dead) ops in the source block.
     is_unstructured: bool = False
-    current_block: "Block | None" = None
-    function_region: "Region | None" = None
-    break_targets: list["Block"] = field(default_factory=list["Block"])
-    continue_targets: list["Block"] = field(default_factory=list["Block"])
+    current_block: Block | None = None
+    function_region: Region | None = None
+    break_targets: list[Block] = field(default_factory=list["Block"])
+    continue_targets: list[Block] = field(default_factory=list["Block"])
     block_terminated: bool = False
 
 
@@ -128,7 +126,7 @@ class ProgramState:
     # Module-level prelude ops to splice in front of the lowered module body
     # (used by component handlers to hoist e.g. `memref.global` for
     # function-local constant arrays — Task 5.2).
-    module_prelude_ops: list["Operation"]
+    module_prelude_ops: list[Operation]
     next_literal_id: int
 
     def __init__(self) -> None:
@@ -149,7 +147,7 @@ class ProgramState:
         self.next_literal_id += 1
         return sym
 
-    def append_module_prelude_op(self, op: "Operation") -> None:
+    def append_module_prelude_op(self, op: Operation) -> None:
         """Queue an op to be spliced into the front of the lowered module."""
         self.module_prelude_ops.append(op)
 

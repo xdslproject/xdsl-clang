@@ -21,7 +21,6 @@ from pathlib import Path
 
 import pytest
 
-
 C_ROOT = Path(__file__).parent
 REPO_ROOT = C_ROOT.parent.parent
 ASSERTION_O = C_ROOT / "build" / "assertion.o"
@@ -81,9 +80,7 @@ def test_xclang_e2e(tmp_path: Path, src: Path):
     if XCLANG is None:
         pytest.skip("xclang not on PATH")
     if not ASSERTION_O.exists():
-        pytest.skip(
-            f"assertion.o missing — run `make -C tests/c/build baseline` first"
-        )
+        pytest.skip("assertion.o missing — run `make -C tests/c/build baseline` first")
 
     rel = f"{src.parent.name}/{src.name}"
     if rel in EXPECTED_FAIL:
@@ -97,10 +94,14 @@ def test_xclang_e2e(tmp_path: Path, src: Path):
         [
             XCLANG,
             str(src),
-            "-o", str(out),
-            "--tempdir", str(workdir),
-            "--linkobj", str(ASSERTION_O),
-            "-v", "0",
+            "-o",
+            str(out),
+            "--tempdir",
+            str(workdir),
+            "--linkobj",
+            str(ASSERTION_O),
+            "-v",
+            "0",
         ],
         check=False,
     ).returncode

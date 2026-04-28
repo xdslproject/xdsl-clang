@@ -9,8 +9,8 @@ resolve them when handlers look up `ctx[op.lhs]`.
 from __future__ import annotations
 
 from xdsl.dialects import arith, func, llvm, memref
-from xdsl.dialects.builtin import FunctionType, IndexType, IntegerType, MemRefType
-from xdsl.ir import Block, Operation, Region, SSAValue
+from xdsl.dialects.builtin import FunctionType, IntegerType, MemRefType
+from xdsl.ir import Attribute, Block, Operation, Region, SSAValue
 from xdsl.utils.hints import isa
 
 from xdsl_clang.dialects import cir
@@ -28,8 +28,8 @@ def _convert_func_signature(
     program_state: ProgramState,
     *,
     is_extern: bool = False,
-) -> tuple[list, list]:
-    inputs: list = []
+) -> tuple[list[Attribute], list[Attribute]]:
+    inputs: list[Attribute] = []
     for arg_ty in func_type.inputs.data:
         if is_extern and isa(arg_ty, cir.PointerType):
             # Extern declarations follow the plain C ABI: every pointer
@@ -47,7 +47,7 @@ def _convert_func_signature(
         inputs.append(
             convert_cir_type_to_standard(arg_ty, program_state, ptr_mode=mode)
         )
-    results: list = []
+    results: list[Attribute] = []
     if not func_type.has_void_return:
         results.append(
             convert_cir_type_to_standard(
@@ -160,10 +160,8 @@ def translate_function(
                 # are dead — typically a trailing `cir.yield`. Drop them.
                 if fn_state.is_unstructured and fn_state.block_terminated:
                     continue
-                for new_op in statements.translate_stmt(
-                    program_state, fn_ctx, body_op
-                ):
-                    if fn_state.current_block is None:
+                for new_op in statements.translate_stmt(program_state, fn_ctx, body_op):
+                    if fn_state.current_block is None:  # type: ignore[reportUnnecessaryComparison]
                         raise RuntimeError(
                             "cir-to-core: current_block became None during "
                             "function translation"
@@ -175,10 +173,12 @@ def translate_function(
         fn_state.current_block = None
         program_state.leaveFunction()
 
-    visibility = "private" if op.sym_visibility is not None and op.sym_visibility.data == "private" else None
-    new_func = func.FuncOp(
-        sym, fn_type, region=new_region, visibility=visibility
+    visibility = (
+        "private"
+        if op.sym_visibility is not None and op.sym_visibility.data == "private"
+        else None
     )
+    new_func = func.FuncOp(sym, fn_type, region=new_region, visibility=visibility)
     return new_func
 
 
@@ -251,7 +251,7 @@ def translate_call(
         else:
             args.append(val)
 
-    result_types = []
+    result_types: list[Attribute] = []
     if fn_def.return_type is not None:
         result_types.append(
             convert_cir_type_to_standard(fn_def.return_type, program_state)
@@ -263,7 +263,7 @@ def translate_call(
         # count is the length of the declared formal-args list.
         n_fixed = len(fn_def.args)
         n_variadic = max(0, len(args) - n_fixed)
-        ret_for_call = result_types[0] if result_types else None
+        ret_for_call: Attribute | None = result_types[0] if result_types else None
         new_call = llvm.CallOp(
             callee_sym,
             *args,
@@ -274,10 +274,8 @@ def translate_call(
         # builder skips it when `variadic_args==0`, but mlir-opt rejects
         # the call without it (e.g. `printf("hi")`).
         if new_call.var_callee_type is None:
-            fixed_input_types = [
-                SSAValue.get(args[i]).type for i in range(n_fixed)
-            ]
-            void_or_ret = (
+            fixed_input_types = [SSAValue.get(args[i]).type for i in range(n_fixed)]
+            void_or_ret: Attribute = (
                 ret_for_call if ret_for_call is not None else llvm.LLVMVoidType()
             )
             new_call.properties["var_callee_type"] = llvm.LLVMFunctionType(

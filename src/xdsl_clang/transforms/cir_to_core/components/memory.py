@@ -13,18 +13,17 @@ from __future__ import annotations
 
 from xdsl.dialects import arith, llvm, memref
 from xdsl.dialects.builtin import (
-    AnyFloat,
     DYNAMIC_INDEX,
-    DenseArrayBase,
+    AnyFloat,
+    ArrayAttr,
     DenseIntOrFPElementsAttr,
-    FloatAttr,
     IntegerAttr,
     IntegerType,
     MemRefType,
+    Signedness,
     StringAttr,
+    TensorType,
     UnitAttr,
-    i32,
-    i64,
 )
 from xdsl.ir import Attribute, Block, Operation, Region
 from xdsl.utils.hints import isa
@@ -37,6 +36,7 @@ from xdsl_clang.transforms.cir_to_core.components.cir_types import (
 from xdsl_clang.transforms.cir_to_core.misc.c_code_description import ProgramState
 from xdsl_clang.transforms.cir_to_core.misc.ssa_context import SSAValueCtx
 
+_AnyIntegerType = IntegerType[int, Signedness]
 
 # ---------------------------------------------------------------------------
 # cir.alloca
@@ -91,7 +91,7 @@ def translate_alloca(
     if isa(alloca_ty, cir.ArrayType):
         result_ty = convert_cir_type_to_standard(alloca_ty, program_state)
         # `result_ty` is already `memref<NxT>`.
-        assert isinstance(result_ty, MemRefType)
+        assert isa(result_ty, MemRefType[Attribute])
         alloca_op = memref.AllocaOp.get(
             result_ty.get_element_type(), shape=list(result_ty.get_shape())
         )
@@ -126,10 +126,8 @@ def translate_get_global(
         target_ty = convert_cir_type_to_standard(cir_ty, program_state)
     else:
         # scalar global — must be a memref<T>
-        target_ty = MemRefType(
-            convert_cir_type_to_standard(cir_ty, program_state), []
-        )
-    assert isinstance(target_ty, MemRefType)
+        target_ty = MemRefType(convert_cir_type_to_standard(cir_ty, program_state), [])
+    assert isa(target_ty, MemRefType[Attribute])
     new = memref.GetGlobalOp(sym, target_ty)
     ctx[op.results[0]] = new.results[0]
     return [new]
@@ -140,97 +138,68 @@ def translate_get_global(
 # ---------------------------------------------------------------------------
 
 
-def _const_ops_for_init(
-    program_state: ProgramState, attr: Attribute, target_ty: Attribute
-) -> tuple[list[Operation], Attribute | None]:
-    """Build init-region ops for a global initialiser.
-
-    Returns `(ops, dense_value)`. If `dense_value` is non-None the caller
-    can shortcut to `memref.global` with that initial value; otherwise the
-    `ops` list ends in the value to wrap in `llvm.return`.
-    """
-    if isa(attr, cir.CIRIntAttr):
-        # Either a memref.global with an integer initial value (legal only
-        # for memref<...xiN>, not memref<iN>), or an arith.constant for the
-        # llvm.global region form.
-        const = arith.ConstantOp(
-            IntegerAttr(attr.value.value.data, target_ty), target_ty
-        )
-        return [const], None
-    if isa(attr, cir.CIRFPAttr):
-        assert isinstance(target_ty, AnyFloat)
-        const = arith.ConstantOp(
-            FloatAttr(attr.value.value.data, target_ty), target_ty
-        )
-        return [const], None
-    if isa(attr, cir.ZeroAttr):
-        # `#cir.zero` for an array type — emit a zero memref initial value.
-        # Caller will detect this via the second return value.
-        return [], zero_dense_for_type(target_ty)
-    if isa(attr, cir.ConstArrayAttr):
-        # Materialise as a DenseElementsAttr if possible — only legal for
-        # element-wise scalar constants of uniform type.
-        dense = const_array_to_dense(program_state, attr, target_ty)
-        return [], dense
-    raise NotImplementedError(
-        f"cir-to-core: unsupported global initialiser {type(attr).__name__}"
-    )
-
-
 def zero_dense_for_type(target_ty: Attribute) -> Attribute:
-    if isinstance(target_ty, MemRefType):
+    if isa(target_ty, MemRefType[Attribute]):
         elem = target_ty.get_element_type()
-        if isinstance(elem, IntegerType):
-            zero = IntegerAttr(0, elem)
-        elif isinstance(elem, AnyFloat):
-            zero = FloatAttr(0.0, elem)
-        else:
-            raise NotImplementedError(
-                f"cir-to-core: can't zero-init memref of {elem}"
-            )
-        from xdsl.dialects.builtin import TensorType
-
         # memref.global accepts a tensor splat as its initial_value.
-        tensor_ty = TensorType(elem, list(target_ty.get_shape()))
-        return DenseIntOrFPElementsAttr.create_dense_int(tensor_ty, [zero.value.data]) if isinstance(elem, IntegerType) else DenseIntOrFPElementsAttr.create_dense_float(tensor_ty, [zero.value.data])
+        if isa(elem, _AnyIntegerType):
+            int_tensor_ty = TensorType(elem, list(target_ty.get_shape()))
+            return DenseIntOrFPElementsAttr.from_list(int_tensor_ty, [0])
+        if isinstance(elem, AnyFloat):
+            fp_tensor_ty = TensorType(elem, list(target_ty.get_shape()))
+            return DenseIntOrFPElementsAttr.from_list(fp_tensor_ty, [0.0])
+        raise NotImplementedError(f"cir-to-core: can't zero-init memref of {elem}")
     raise NotImplementedError("cir-to-core: zero-init unsupported here")
 
 
 def const_array_to_dense(
     program_state: ProgramState, attr: cir.ConstArrayAttr, target_ty: Attribute
 ) -> Attribute:
-    if not isinstance(target_ty, MemRefType):
+    if not isa(target_ty, MemRefType[Attribute]):
         raise NotImplementedError("cir-to-core: const array global must target memref")
     elem = target_ty.get_element_type()
-    from xdsl.dialects.builtin import TensorType
 
-    tensor_ty = TensorType(elem, list(target_ty.get_shape()))
-    values: list = []
     elements = attr.elts
-    if isinstance(elements, StringAttr):
-        # String literals: each byte → i8 element.
-        for ch in elements.data:
-            values.append(ord(ch))
-        # Trailing null is implicit at the C level, but the array length
-        # already carries it through the type.
-        # Pad with zeros if the array type is longer than the string.
-        n = target_ty.get_shape()[0]
-        while len(values) < n:
-            values.append(0)
-        return DenseIntOrFPElementsAttr.create_dense_int(tensor_ty, values)
-    # ArrayAttr of typed scalar attrs.
-    for entry in elements.data:
-        if isa(entry, cir.CIRIntAttr):
-            values.append(entry.value.value.data)
-        elif isa(entry, cir.CIRFPAttr):
-            values.append(entry.value.value.data)
+    if isa(elem, _AnyIntegerType):
+        int_tensor_ty = TensorType(elem, list(target_ty.get_shape()))
+        int_values: list[int] = []
+        if isinstance(elements, StringAttr):
+            # String literals: each byte → i8 element.
+            for ch in elements.data:
+                int_values.append(ord(ch))
+            # Trailing null is implicit at the C level, but the array length
+            # already carries it through the type.
+            # Pad with zeros if the array type is longer than the string.
+            n = target_ty.get_shape()[0]
+            while len(int_values) < n:
+                int_values.append(0)
         else:
-            raise NotImplementedError(
-                f"cir-to-core: const-array element {type(entry).__name__}"
-            )
-    if isinstance(elem, IntegerType):
-        return DenseIntOrFPElementsAttr.create_dense_int(tensor_ty, values)
-    return DenseIntOrFPElementsAttr.create_dense_float(tensor_ty, values)
+            assert isa(elements, ArrayAttr[Attribute])
+            for entry in elements.data:
+                if isa(entry, cir.CIRIntAttr):
+                    int_values.append(entry.value.value.data)
+                else:
+                    raise NotImplementedError(
+                        f"cir-to-core: const-array int element {type(entry).__name__}"
+                    )
+        return DenseIntOrFPElementsAttr.from_list(int_tensor_ty, int_values)
+
+    if isinstance(elem, AnyFloat):
+        fp_tensor_ty = TensorType(elem, list(target_ty.get_shape()))
+        fp_values: list[float] = []
+        if isinstance(elements, StringAttr):
+            raise NotImplementedError("cir-to-core: string init for float array")
+        assert isa(elements, ArrayAttr[Attribute])
+        for entry in elements.data:
+            if isa(entry, cir.CIRFPAttr):
+                fp_values.append(entry.value.value.data)
+            else:
+                raise NotImplementedError(
+                    f"cir-to-core: const-array float element {type(entry).__name__}"
+                )
+        return DenseIntOrFPElementsAttr.from_list(fp_tensor_ty, fp_values)
+
+    raise NotImplementedError(f"cir-to-core: const-array element type {elem}")
 
 
 def translate_global(
@@ -251,8 +220,8 @@ def translate_global(
                 raise NotImplementedError(
                     "cir-to-core: non-zero record global initialisers"
                 )
-        zero = llvm.ZeroOp(result_type=struct_ty)
-        ret = llvm.ReturnOp(operands=[zero.results[0]])
+        zero = llvm.ZeroOp.build(result_types=[struct_ty])
+        ret = llvm.ReturnOp(zero.results[0])
         body_block.add_op(zero)
         body_block.add_op(ret)
         return [
@@ -269,10 +238,8 @@ def translate_global(
     if isa(cir_ty, cir.ArrayType):
         target_ty = convert_cir_type_to_standard(cir_ty, program_state)
     else:
-        target_ty = MemRefType(
-            convert_cir_type_to_standard(cir_ty, program_state), []
-        )
-    assert isinstance(target_ty, MemRefType)
+        target_ty = MemRefType(convert_cir_type_to_standard(cir_ty, program_state), [])
+    assert isa(target_ty, MemRefType[Attribute])
 
     init_attr: Attribute | None = None
     if op.initial_value is not None:
@@ -282,22 +249,18 @@ def translate_global(
             init_attr = UnitAttr()
         elif isa(attr, cir.CIRIntAttr):
             # Scalar memref<T>: wrap in a 1-element dense.
-            from xdsl.dialects.builtin import TensorType
-
-            elem = target_ty.get_element_type()
-            assert isinstance(elem, IntegerType)
-            tensor_ty = TensorType(elem, [])
-            init_attr = DenseIntOrFPElementsAttr.create_dense_int(
-                tensor_ty, [attr.value.value.data]
+            elem_int = target_ty.get_element_type()
+            assert isa(elem_int, _AnyIntegerType)
+            int_tensor_ty = TensorType(elem_int, [])
+            init_attr = DenseIntOrFPElementsAttr.from_list(
+                int_tensor_ty, [attr.value.value.data]
             )
         elif isa(attr, cir.CIRFPAttr):
-            from xdsl.dialects.builtin import TensorType
-
-            elem = target_ty.get_element_type()
-            assert isinstance(elem, AnyFloat)
-            tensor_ty = TensorType(elem, [])
-            init_attr = DenseIntOrFPElementsAttr.create_dense_float(
-                tensor_ty, [attr.value.value.data]
+            elem_fp = target_ty.get_element_type()
+            assert isinstance(elem_fp, AnyFloat)
+            fp_tensor_ty = TensorType(elem_fp, [])
+            init_attr = DenseIntOrFPElementsAttr.from_list(
+                fp_tensor_ty, [attr.value.value.data]
             )
         elif isa(attr, cir.ConstArrayAttr):
             init_attr = const_array_to_dense(program_state, attr, target_ty)
@@ -312,7 +275,11 @@ def translate_global(
                 f"cir-to-core: global initialiser {type(attr).__name__}"
             )
 
-    sym_visibility = "private" if op.sym_visibility is not None and op.sym_visibility.data == "private" else "public"
+    sym_visibility = (
+        "private"
+        if op.sym_visibility is not None and op.sym_visibility.data == "private"
+        else "public"
+    )
     constant = op.constant is not None
 
     if init_attr is None:
@@ -329,7 +296,3 @@ def translate_global(
         constant=UnitAttr() if constant else None,
     )
     return [new]
-
-
-# Silence unused-import warnings for placeholder helpers.
-_ = (DenseArrayBase, i32, i64)
