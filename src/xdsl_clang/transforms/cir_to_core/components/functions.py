@@ -254,6 +254,19 @@ def translate_call(
             return_type=ret_for_call,
             variadic_args=n_variadic,
         )
+        # Always populate `var_callee_type` for variadic callees — xdsl's
+        # builder skips it when `variadic_args==0`, but mlir-opt rejects
+        # the call without it (e.g. `printf("hi")`).
+        if new_call.var_callee_type is None:
+            fixed_input_types = [
+                SSAValue.get(args[i]).type for i in range(n_fixed)
+            ]
+            void_or_ret = (
+                ret_for_call if ret_for_call is not None else llvm.LLVMVoidType()
+            )
+            new_call.properties["var_callee_type"] = llvm.LLVMFunctionType(
+                fixed_input_types, void_or_ret, True
+            )
         if result_types:
             ctx[op.results[0]] = new_call.results[0]
         return [*pre_ops, new_call]

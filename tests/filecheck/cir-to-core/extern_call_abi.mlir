@@ -10,6 +10,7 @@
 
 !s8i = !cir.int<s, 8>
 !s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
 
 module {
   // Extern decl with a `!cir.ptr<!s8i>` arg: lowers to `!llvm.ptr` — not
@@ -60,4 +61,35 @@ module {
   }
   // CHECK:      func.func @caller(%[[P3:.*]]: memref<?xi8>) -> i32 {
   // CHECK-NEXT:   %[[R3:.*]] = func.call @internal_callee(%[[P3]]) : (memref<?xi8>) -> i32
+
+  // ---------------------------------------------------------------------
+  // Variadic externs (e.g. `printf`). The `func` dialect has no variadic
+  // concept, so variadic externs lower to `llvm.func` declarations and
+  // call sites use `llvm.call` (with `var_callee_type` carrying the
+  // variadic signature so mlir-opt can reify the call).
+  // ---------------------------------------------------------------------
+
+  cir.func private @printf(!cir.ptr<!s8i>, ...) -> !s32i
+
+  // CHECK:      llvm.func @printf(!llvm.ptr, ...) -> i32
+
+  // No variadic args (just the format string): the call still needs the
+  // `var_callee_type` so mlir-opt accepts it.
+  cir.func @run_printf_noargs(%fmt: !cir.ptr<!s8i>) -> !s32i {
+    %r = cir.call @printf(%fmt) : (!cir.ptr<!s8i>) -> !s32i
+    cir.return %r : !s32i
+  }
+  // CHECK:      func.func @run_printf_noargs(%[[F:.*]]: memref<?xi8>) -> i32 {
+  // CHECK:        %[[FP:.*]] = llvm.inttoptr %{{.*}} : i64 to !llvm.ptr
+  // CHECK-NEXT:   %{{.*}} = "llvm.call"(%[[FP]]){{.*}}callee = @printf{{.*}}var_callee_type = !llvm.func<i32 (!llvm.ptr, ...)>{{.*}}: (!llvm.ptr) -> i32
+
+  // Variadic args of mixed types: the format pointer goes through the
+  // memref → `!llvm.ptr` bridge; the trailing scalar passes through.
+  cir.func @run_printf_mixed(%fmt: !cir.ptr<!s8i>, %n: !s64i) -> !s32i {
+    %r = cir.call @printf(%fmt, %n) : (!cir.ptr<!s8i>, !s64i) -> !s32i
+    cir.return %r : !s32i
+  }
+  // CHECK:      func.func @run_printf_mixed(%[[F2:.*]]: memref<?xi8>, %[[N:.*]]: i64) -> i32 {
+  // CHECK:        %[[FP2:.*]] = llvm.inttoptr %{{.*}} : i64 to !llvm.ptr
+  // CHECK-NEXT:   %{{.*}} = "llvm.call"(%[[FP2]], %{{.*}}){{.*}}callee = @printf{{.*}}var_callee_type = !llvm.func<i32 (!llvm.ptr, ...)>{{.*}}: (!llvm.ptr, i64) -> i32
 }
