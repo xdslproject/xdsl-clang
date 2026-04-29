@@ -18,6 +18,7 @@ handle to lower the existing C corpus (excluding `swm_openmp.c`).
 | `cir.condition`   | 2d    | `scf.while` before-region terminator           |
 | `cir.const`       | 2c    | Including `#cir.const_array`, `#cir.zero`      |
 | `cir.continue`    | 2d    | Triggers unstructured loop lowering            |
+| `cir.do`          | 2d/5.8 | Unstructured emitter (body-then-cond)          |
 | `cir.for`         | 2d    |                                                |
 | `cir.func`        | 2e    |                                                |
 | `cir.get_element` | 2b    | Array element access                           |
@@ -32,6 +33,8 @@ handle to lower the existing C corpus (excluding `swm_openmp.c`).
 | `cir.scope`       | 2d    | Inline; introduces alloca scope                |
 | `cir.select`      | 2c    |                                                |
 | `cir.store`       | 2b    |                                                |
+| `cir.switch`      | 2d/5.9 | `cf.cond_br` chain (anyof / range / default)   |
+| `cir.switch.flat` | 2d/5.9 | `cf.cond_br` chain (LLVM-style terminator)     |
 | `cir.ternary`     | 2c    |                                                |
 | `cir.unary`       | 2c    |                                                |
 | `cir.while`       | 2d    |                                                |
@@ -39,10 +42,9 @@ handle to lower the existing C corpus (excluding `swm_openmp.c`).
 
 ## Ops *not* present in corpus (handled by best-effort fallback)
 
-`cir.do`, `cir.brcond`, `cir.switch`, `cir.switch.flat`, `cir.unreachable`,
-`cir.trap`, `cir.copy`, `cir.complex.*`, `cir.vec.*`, `cir.va_*`. These are
-deferred until a corpus test actually needs them; the dispatcher should
-raise on unknown ops so we notice.
+`cir.brcond`, `cir.unreachable`, `cir.trap`, `cir.copy`, `cir.complex.*`,
+`cir.vec.*`, `cir.va_*`. These are deferred until a corpus test actually
+needs them; the dispatcher should raise on unknown ops so we notice.
 
 ## Types
 
