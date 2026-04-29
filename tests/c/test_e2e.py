@@ -30,6 +30,15 @@ XCLANG = shutil.which("xclang")
 CORPUS_DIRS = ["fragments", "solvers", "advection", "swm"]
 SKIP_FILES = {"swm_openmp.c"}
 
+# Per-test runtime budgets. The default 60s is fine for fragments and the
+# small solvers; the heavy CPU-bound benchmarks (full-size iterative kernels)
+# need longer. Times empirically measured on a desktop x86_64 box; CI may
+# need to adjust if its hardware is materially slower.
+DEFAULT_TIMEOUT = 60
+RUN_TIMEOUTS = {
+    "solvers/jacobi.c": 300,
+}
+
 # Phase 5 hardening turns these into xpass — list of test ids that we
 # expect to fail (strict=False so xpass doesn't error).
 EXPECTED_FAIL = {
@@ -40,17 +49,18 @@ EXPECTED_FAIL = {
     "fragments/allocatables.c",
     "fragments/array_ops.c",  # malloc/free void* bitcast
     "fragments/pointers.c",
-    # Task 5.7 unblocked do_loops and while_loops — they pass end-to-end.
-    # jacobi.c also lowers and runs, but takes ~2 minutes to complete
-    # (CPU-bound iterative solver) which exceeds the per-test timeout in
-    # this harness; keep it on the xfail list until a smaller-grid harness
-    # variant is available.
-    "solvers/jacobi.c",
-    # heavy benchmarks — Phase 5. `tra_adv.c`, `swm/swm.c`, and
-    # `swm/swm_orig.c` build and run end-to-end after Tasks F3 + F5, but
-    # the kernels are heavy numerical simulations that exceed the
-    # harness's per-test runtime budget — Task F4.
+    # `tra_adv.c` builds and runs but the 1024×512×512 NEMO advection
+    # kernel allocates ~25 GB of memref descriptors and exceeds any
+    # reasonable per-test runtime budget — needs the smaller-fixture
+    # variant in F4 Option 1 (a `tra_adv_small.c` with reduced grid)
+    # before it can flip to a regular harness pass.
     "advection/tra_adv.c",
+    # `swm/swm.c` and `swm/swm_orig.c` build cleanly after Tasks F3 + F5,
+    # and run to completion when stdout is a TTY, but segfault during
+    # printing of the initial-state diagonals when stdout is redirected
+    # to a file or pipe. The crash is data-dependent (depends on stdout
+    # buffering), pointing at heap corruption from somewhere in the
+    # simulation — separate bug to investigate, not an F4 harness issue.
     "swm/swm.c",
     "swm/swm_orig.c",
 }
@@ -102,7 +112,12 @@ def test_xclang_e2e(tmp_path: Path, src: Path):
     assert out.exists(), f"executable not produced: {out}"
 
     # Quick tests use the [PASS] harness; numerical kernels just exit 0.
-    runres = subprocess.run([str(out)], capture_output=True, text=True, timeout=60)
+    runres = subprocess.run(
+        [str(out)],
+        capture_output=True,
+        text=True,
+        timeout=RUN_TIMEOUTS.get(rel, DEFAULT_TIMEOUT),
+    )
     assert runres.returncode == 0, f"{src} exited {runres.returncode}\n{runres.stdout}"
     if src.parent.name == "fragments":
         assert runres.stdout.startswith("[PASS]"), (
