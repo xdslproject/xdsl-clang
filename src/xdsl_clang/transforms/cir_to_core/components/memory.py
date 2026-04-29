@@ -47,21 +47,37 @@ _AnyIntegerType = IntegerType[int, Signedness]
 def translate_alloca(
     program_state: ProgramState, ctx: SSAValueCtx, op: cir.AllocaOp
 ) -> list[Operation]:
+    """Lower a `cir.alloca`.
+
+    Static allocas are routed to the function's *entry block* rather than
+    appended at the cursor. That hoist is essential for correctness: an
+    `alloca` outside the entry block lowers to a dynamic LLVM-IR `alloca`
+    which adjusts the stack pointer per execution and never gives the
+    memory back until the function returns. In a long-running loop (e.g.
+    `swm.c` with ITMAX=4000) the per-iteration loop-counter slots
+    accumulate ~8 MB of stack and the program SIGSEGVs once the limit is
+    hit. Hoisting is the standard frontend pattern for this exact issue.
+
+    Dynamic-sized allocas (`T arr[N]` with runtime `N`) are left at the
+    cursor because their size operand isn't available at function entry —
+    a VLA inside a tight loop is a separate concern.
+    """
     alloca_ty = op.alloca_type
+    fn_state = program_state.getCurrentFnState()
+    entry_block = fn_state.entry_block
+
     # Records → llvm.alloca returning !llvm.ptr (Decision 3).
     if isa(alloca_ty, cir.RecordType):
         struct_ty = convert_cir_type_to_standard(alloca_ty, program_state)
         one = arith.ConstantOp(IntegerAttr(1, 32), IntegerType(32))
         new = llvm.AllocaOp(one.results[0], elem_type=struct_ty)
         ctx[op.results[0]] = new.results[0]
-        return [one, new]
+        return _route_static_allocas([one, new], entry_block)
 
     # Numeric/pointer alloca → memref.alloca/alloc. When the alloca is a
     # *slot for a pointer* (`int **`-style), use the same decayed memref
     # convention as function arguments so subsequent `cir.store %decayed,
     # %slot` types line up. See Decision 1 + Phase 2b plan.
-    from xdsl_clang.transforms.cir_to_core.components.cir_types import DECAYED_PTR
-
     if isa(alloca_ty, cir.PointerType):
         elem_ty = convert_cir_type_to_standard(
             alloca_ty, program_state, ptr_mode=DECAYED_PTR
@@ -73,7 +89,7 @@ def translate_alloca(
     if op.dyn_alloc_size:
         # Dynamic-sized stack allocation: `T alloc[N]` where N is a runtime
         # integer. CIR shape is element-count of `alloca_type`. Lower the
-        # result to `memref<?x<elem>>`.
+        # result to `memref<?x<elem>>`. Stays at the cursor — see docstring.
         from xdsl.dialects.builtin import IndexType
 
         dyn_in = ctx[op.dyn_alloc_size[0]]
@@ -99,7 +115,24 @@ def translate_alloca(
     else:
         alloca_op = memref.AllocaOp.get(elem_ty, shape=[])
     ctx[op.results[0]] = alloca_op.memref
-    return [alloca_op]
+    return _route_static_allocas([alloca_op], entry_block)
+
+
+def _route_static_allocas(
+    ops: list[Operation], entry_block: Block | None
+) -> list[Operation]:
+    """Side-effect: append `ops` to the function's entry block and return
+    `[]`, so the dispatcher leaves the cursor block untouched.
+
+    If there is no entry block (shouldn't happen for any well-formed
+    function, but be conservative), return the ops as usual so the
+    dispatcher places them at the cursor.
+    """
+    if entry_block is None:
+        return ops
+    for o in ops:
+        entry_block.add_op(o)
+    return []
 
 
 # ---------------------------------------------------------------------------

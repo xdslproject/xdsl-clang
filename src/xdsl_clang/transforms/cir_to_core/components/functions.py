@@ -144,6 +144,7 @@ def translate_function(
     fn_state = program_state.getCurrentFnState()
     setattr(program_state, "_block_map", block_map)
     fn_state.function_region = new_region
+    fn_state.entry_block = block_map[op.body.blocks[0]] if op.body.blocks else None
     fn_state.is_unstructured = _has_break_or_continue_anywhere(
         op
     ) or _has_nested_return(op)
@@ -171,6 +172,7 @@ def translate_function(
         delattr(program_state, "_block_map")
         fn_state.function_region = None
         fn_state.current_block = None
+        fn_state.entry_block = None
         program_state.leaveFunction()
 
     visibility = (

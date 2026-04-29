@@ -112,6 +112,13 @@ class ComponentState:
     break_targets: list[Block] = field(default_factory=list["Block"])
     continue_targets: list[Block] = field(default_factory=list["Block"])
     block_terminated: bool = False
+    # Function entry block — fixed for the lifetime of the function. All
+    # `cir.alloca` ops are routed here regardless of where they appear in
+    # the source program, so they don't accumulate stack across loop
+    # iterations after lowering to LLVM (LLVM's `alloca` outside the
+    # entry block leaks per-iteration stack, which manifests as a segfault
+    # in long-running iterative kernels — see swm.c).
+    entry_block: Block | None = None
 
 
 class ProgramState:

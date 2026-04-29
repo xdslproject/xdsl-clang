@@ -37,6 +37,8 @@ SKIP_FILES = {"swm_openmp.c"}
 DEFAULT_TIMEOUT = 60
 RUN_TIMEOUTS = {
     "solvers/jacobi.c": 300,
+    "swm/swm.c": 120,
+    "swm/swm_orig.c": 120,
 }
 
 # Phase 5 hardening turns these into xpass — list of test ids that we
@@ -44,18 +46,10 @@ RUN_TIMEOUTS = {
 EXPECTED_FAIL = {
     # `tra_adv.c` builds and runs but the 1024×512×512 NEMO advection
     # kernel allocates ~25 GB of memref descriptors and exceeds any
-    # reasonable per-test runtime budget — needs the smaller-fixture
-    # variant in F4 Option 1 (a `tra_adv_small.c` with reduced grid)
-    # before it can flip to a regular harness pass.
+    # reasonable per-test runtime budget. The companion `tra_adv_small.c`
+    # exercises the same code path with a reduced grid and runs in the
+    # default 60s budget.
     "advection/tra_adv.c",
-    # `swm/swm.c` and `swm/swm_orig.c` build cleanly after Tasks F3 + F5,
-    # and run to completion when stdout is a TTY, but segfault during
-    # printing of the initial-state diagonals when stdout is redirected
-    # to a file or pipe. The crash is data-dependent (depends on stdout
-    # buffering), pointing at heap corruption from somewhere in the
-    # simulation — separate bug to investigate, not an F4 harness issue.
-    "swm/swm.c",
-    "swm/swm_orig.c",
 }
 
 
