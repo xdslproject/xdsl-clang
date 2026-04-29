@@ -62,6 +62,25 @@ module {
   // CHECK:      func.func @caller(%[[P3:.*]]: memref<?xi8>) -> i32 {
   // CHECK-NEXT:   %[[R3:.*]] = func.call @internal_callee(%[[P3]]) : (memref<?xi8>) -> i32
 
+  // Task F3: address-of-local-scalar passed to an internal callee whose
+  // arg lowers to rank-1 `memref<?xi32>`. The call site needs a
+  // `memref.cast` to lift the static rank to dynamic.
+  cir.func @helper(%q: !cir.ptr<!s32i>) -> !s32i {
+    %z = cir.const #cir.int<0> : !s32i
+    cir.return %z : !s32i
+  }
+
+  cir.func @ranklift_caller() -> !s32i {
+    %x = cir.alloca !s32i, !cir.ptr<!s32i>, ["x"] {alignment = 4 : i64}
+    %r = cir.call @helper(%x) : (!cir.ptr<!s32i>) -> !s32i
+    cir.return %r : !s32i
+  }
+  // CHECK:      func.func @ranklift_caller() -> i32 {
+  // CHECK-NEXT:   %[[X:.*]] = memref.alloca() : memref<i32>
+  // CHECK-NEXT:   %[[XS:.*]] = memref.reinterpret_cast %[[X]] to offset: [0], sizes: [1], strides: [1] : memref<i32> to memref<1xi32>
+  // CHECK-NEXT:   %[[XD:.*]] = "memref.cast"(%[[XS]]) : (memref<1xi32>) -> memref<?xi32>
+  // CHECK-NEXT:   %{{.*}} = func.call @helper(%[[XD]]) : (memref<?xi32>) -> i32
+
   // ---------------------------------------------------------------------
   // Variadic externs (e.g. `printf`). The `func` dialect has no variadic
   // concept, so variadic externs lower to `llvm.func` declarations and

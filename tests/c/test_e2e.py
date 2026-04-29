@@ -46,18 +46,10 @@ EXPECTED_FAIL = {
     # this harness; keep it on the xfail list until a smaller-grid harness
     # variant is available.
     "solvers/jacobi.c",
-    # `procedures.c` lowers past the index-arity error but trips a
-    # call-site rank mismatch: a local `int val` (rank-0 `memref<i32>`)
-    # is passed to a function whose `int *b` arg lowers to rank-1
-    # `memref<?xi32>` — separate Task 5.5 follow-up.
-    "fragments/procedures.c",
-    # heavy benchmarks — Phase 5. `tra_adv.c` and `swm/swm.c` build and
-    # run end-to-end after Task F5 (llvm.load/store via cir.get_member),
-    # but the kernels are heavy numerical simulations that exceed the
-    # harness's per-test runtime budget — Task F4. `swm/swm_orig.c`
-    # additionally needs Task F3 (rank-0 → rank-1 memref.cast at internal
-    # call sites — `dswap(&u, &unew)` passes `memref<memref<?xf32>>` for a
-    # `memref<?xmemref<?xf32>>` arg).
+    # heavy benchmarks — Phase 5. `tra_adv.c`, `swm/swm.c`, and
+    # `swm/swm_orig.c` build and run end-to-end after Tasks F3 + F5, but
+    # the kernels are heavy numerical simulations that exceed the
+    # harness's per-test runtime budget — Task F4.
     "advection/tra_adv.c",
     "swm/swm.c",
     "swm/swm_orig.c",

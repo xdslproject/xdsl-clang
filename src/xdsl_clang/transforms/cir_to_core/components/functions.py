@@ -234,7 +234,7 @@ def translate_call(
 
     pre_ops: list[Operation] = []
     args: list[SSAValue] = []
-    for a in op.arg_ops:
+    for arg_idx, a in enumerate(op.arg_ops):
         mapped = ctx[a]
         val = mapped if mapped is not None else a
         if is_extern_callee and isa(val.type, MemRefType):
@@ -248,8 +248,55 @@ def translate_call(
             to_ptr = llvm.IntToPtrOp(cast.results[0])
             pre_ops.extend([extract, cast, to_ptr])
             args.append(to_ptr.results[0])
-        else:
-            args.append(val)
+            continue
+        # Task F3: internal-call shape lift. `helper(&local)` passes a
+        # rank-0 `memref<T>` (address-of-scalar) to a callee whose `T*`
+        # parameter lowers to rank-1 `memref<?xT>` under the decayed-pointer
+        # convention. Insert a `memref.cast` so the static rank lifts to
+        # dynamic. Same fix applies to passing `memref<memref<?xT>>`
+        # (rank-0 pointer slot) for a `memref<?xmemref<?xT>>` parameter
+        # (e.g. `dswap(&u, &unew)` in swm_orig.c).
+        if not is_extern_callee and arg_idx < len(fn_def.args):
+            formal_cir = fn_def.args[arg_idx].cir_type
+            mode = DECAYED_PTR if isa(formal_cir, cir.PointerType) else SCALAR_PTR
+            formal_ty = convert_cir_type_to_standard(
+                formal_cir, program_state, ptr_mode=mode
+            )
+            if (
+                isa(val.type, MemRefType)
+                and isa(formal_ty, MemRefType)
+                and val.type != formal_ty
+                and val.type.get_element_type() == formal_ty.get_element_type()
+            ):
+                src_rank = val.type.get_num_dims()
+                dst_rank = formal_ty.get_num_dims()
+                if src_rank == dst_rank:
+                    # Same rank, only static-vs-dynamic shape differs —
+                    # `memref.cast` is the right shape lift.
+                    shape_lift = memref.CastOp.get(val, formal_ty)
+                    pre_ops.append(shape_lift)
+                    args.append(shape_lift.results[0])
+                    continue
+                if src_rank == 0 and dst_rank == 1:
+                    # Address-of-scalar passed as a decayed pointer arg:
+                    # lift rank-0 `memref<T>` → rank-1 `memref<?xT>` of
+                    # length 1. `memref.cast` rejects rank changes, so we
+                    # go through `memref.reinterpret_cast` (rank-0 →
+                    # `memref<1xT>`) and then `memref.cast` (static →
+                    # dynamic shape).
+                    static_ty = MemRefType(formal_ty.get_element_type(), [1])
+                    re_cast = memref.ReinterpretCastOp.from_dynamic(
+                        source=val,
+                        offsets=[0],
+                        sizes=[1],
+                        strides=[1],
+                        result_type=static_ty,
+                    )
+                    shape_lift = memref.CastOp.get(re_cast.results[0], formal_ty)
+                    pre_ops.extend([re_cast, shape_lift])
+                    args.append(shape_lift.results[0])
+                    continue
+        args.append(val)
 
     result_types: list[Attribute] = []
     if fn_def.return_type is not None:
