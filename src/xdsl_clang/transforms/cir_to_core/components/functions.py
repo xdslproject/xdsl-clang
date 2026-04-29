@@ -82,6 +82,17 @@ def _has_dowhile_anywhere(op: cir.FuncOp) -> bool:
     return False
 
 
+def _has_switch_anywhere(op: cir.FuncOp) -> bool:
+    """True iff the function body contains a `cir.switch` (or its flattened
+    LLVM-style `cir.switch.flat` cousin). Switch lowering always emits a
+    block graph (Task 5.9), so the surrounding function must run in
+    unstructured mode."""
+    for inner in op.walk():
+        if isa(inner, cir.SwitchOp) or isa(inner, cir.SwitchFlatOp):
+            return True
+    return False
+
+
 def _has_nested_return(op: cir.FuncOp) -> bool:
     """True iff a `cir.return` appears inside any *nested* region of the
     function body (e.g. inside a `cir.if` or `cir.scope`). Returns at the
@@ -165,6 +176,7 @@ def translate_function(
         _has_break_or_continue_anywhere(op)
         or _has_nested_return(op)
         or _has_dowhile_anywhere(op)
+        or _has_switch_anywhere(op)
     )
     try:
         from xdsl_clang.transforms.cir_to_core import statements

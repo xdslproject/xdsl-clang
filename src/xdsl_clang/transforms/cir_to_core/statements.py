@@ -82,6 +82,10 @@ def try_translate_stmt(
         return cir_ctrl.translate_while(program_state, ctx, op)
     if isa(op, cir.DoWhileOp):
         return cir_ctrl.translate_dowhile(program_state, ctx, op)
+    if isa(op, cir.SwitchOp):
+        return cir_ctrl.translate_switch(program_state, ctx, op)
+    if isa(op, cir.SwitchFlatOp):
+        return cir_ctrl.translate_switch_flat(program_state, ctx, op)
     if isa(op, cir.YieldOp):
         return cir_ctrl.translate_yield(program_state, ctx, op)
     if isa(op, cir.ConditionOp):

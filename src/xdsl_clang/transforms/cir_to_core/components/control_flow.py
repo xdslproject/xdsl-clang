@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from xdsl.dialects import arith, cf, func, scf
-from xdsl.dialects.builtin import IndexType
+from xdsl.dialects.builtin import IndexType, IntegerAttr, IntegerType
 from xdsl.ir import Block, Operation, Region, SSAValue
 from xdsl.utils.hints import isa
 
@@ -769,6 +769,337 @@ def translate_return(
         # append further ops past an early return.
         fn_state.block_terminated = True
     return [func.ReturnOp(*args)]
+
+
+# ---------------------------------------------------------------------------
+# cir.switch / cir.switch.flat — Task 5.9
+# ---------------------------------------------------------------------------
+#
+# Clang's structured form (`cir.switch`) carries a `body` region whose
+# top-level ops are `cir.case` clauses. Each case has a `kind`:
+#
+#   * `equal`   — match the condition against a single integer value
+#   * `anyof`   — match against any of a list of integer values
+#   * `range`   — match against an inclusive integer range `[lo, hi]`
+#   * `default` — fall-through default
+#
+# The case region's terminator is either `cir.break` (break out of the
+# switch) or `cir.yield` (fall-through to the next case body in source
+# order).  Default's body is emitted alongside the value-bearing cases in
+# source order; we honour that order so fall-through into the default case
+# behaves correctly.
+#
+# Lowering target: `cf.cond_br` chain. We considered `scf.index_switch`
+# but it can't represent C-style fall-through (each case must terminate
+# with `scf.yield`) and it disallows `break` in case regions, so it would
+# only work for the trivial subset where every case ends with `cir.break`
+# and never falls through. The block-graph form composes cleanly with the
+# unstructured emitter we already use for break/continue and early-return,
+# and matches what `cir-flatten-cfg` would produce inside CIR.
+#
+# `cir.switch.flat` is the LLVM-style terminator form clang's internal
+# `cir-flatten-cfg` pass produces. Our pipeline runs `cir-to-core` on the
+# pre-flattened structured IR, so `cir.switch.flat` does not surface in
+# practice — but we still wire up a handler for completeness and easier
+# filecheck testing of the flat form.
+
+
+def _case_value_as_int(attr: object) -> int:
+    """Pull the integer value out of a `#cir.int<N> : !cir.int<...>` attr."""
+    if isa(attr, cir.CIRIntAttr):
+        v = attr.value.value.data
+        if attr.int_type.signed:
+            width = attr.int_type.bitwidth
+            if v >= (1 << (width - 1)):
+                v -= 1 << width
+        return v
+    raise NotImplementedError(
+        f"cir-to-core: unsupported cir.case value attribute {attr}"
+    )
+
+
+def _emit_match_predicate(
+    cond: SSAValue,
+    case_op: cir.CaseOp,
+) -> tuple[list[Operation], SSAValue]:
+    """Emit the i1 predicate that picks `case_op` for the given condition.
+
+    Returns the list of ops to splice and the i1 SSA value carrying the
+    match result. Callers attach a `cf.cond_br` consuming the predicate.
+    """
+    kind = case_op.kind.value.data  # 1=equal, 2=anyof, 3=range
+    cond_ty = cond.type
+    assert isa(cond_ty, IntegerType), (
+        f"cir-to-core: switch condition must lower to integer type, got {cond_ty}"
+    )
+
+    def _const_like(value: int) -> arith.ConstantOp:
+        return arith.ConstantOp(IntegerAttr(value, cond_ty), cond_ty)
+
+    new_ops: list[Operation] = []
+    values = list(case_op.value.data)
+
+    if kind == 1 or kind == 2:  # equal / anyof
+        # Build OR-chain of equalities. `equal` always has one value;
+        # `anyof` has >= 1.
+        if not values:
+            raise RuntimeError("cir-to-core: cir.case equal/anyof with no values")
+        running: SSAValue | None = None
+        for v_attr in values:
+            v_int = _case_value_as_int(v_attr)
+            cst = _const_like(v_int)
+            cmp = arith.CmpiOp(cond, cst.results[0], 0)  # 0 = eq
+            new_ops.extend([cst, cmp])
+            if running is None:
+                running = cmp.results[0]
+            else:
+                or_op = arith.OrIOp(running, cmp.results[0])
+                new_ops.append(or_op)
+                running = or_op.results[0]
+        assert running is not None
+        return new_ops, running
+
+    if kind == 3:  # range
+        if len(values) != 2:
+            raise NotImplementedError(
+                "cir-to-core: cir.case range expects exactly 2 bounds"
+            )
+        lo_int = _case_value_as_int(values[0])
+        hi_int = _case_value_as_int(values[1])
+        lo = _const_like(lo_int)
+        hi = _const_like(hi_int)
+        # Use signed predicates (sge=5, sle=3) — clang keeps switch
+        # conditions as signed `int` in the common case; the unsigned
+        # split only matters when the source operand was promoted from an
+        # unsigned narrow type, and clang lowers that with explicit casts.
+        ge = arith.CmpiOp(cond, lo.results[0], 5)
+        le = arith.CmpiOp(cond, hi.results[0], 3)
+        and_op = arith.AndIOp(ge.results[0], le.results[0])
+        new_ops.extend([lo, hi, ge, le, and_op])
+        return new_ops, and_op.results[0]
+
+    raise NotImplementedError(f"cir-to-core: unsupported cir.case kind {kind}")
+
+
+def _collect_switch_cases(switch_op: cir.SwitchOp) -> list[cir.CaseOp]:
+    """Return the `cir.case` ops in source order from a `cir.switch` body.
+
+    `cir.switch` carries a single block whose ops are the case clauses
+    plus a trailing `cir.yield` terminator.
+    """
+    cases: list[cir.CaseOp] = []
+    if not switch_op.body.blocks:
+        return cases
+    for op in switch_op.body.block.ops:
+        if isa(op, cir.CaseOp):
+            cases.append(op)
+        elif isa(op, cir.YieldOp):
+            # Trailing terminator of the switch body — ignored.
+            continue
+        else:
+            raise NotImplementedError(
+                f"cir-to-core: unexpected op {op.name!r} inside cir.switch body"
+            )
+    return cases
+
+
+def translate_switch(
+    program_state: ProgramState, ctx: SSAValueCtx, op: cir.SwitchOp
+) -> list[Operation]:
+    """Lower a structured `cir.switch` to a `cf.cond_br` dispatch chain.
+
+    Layout:
+
+        cur:        <eval cond>;  cf.br ^dispatch0
+        ^dispatch0: <pred for case 0>; cf.cond_br p0, ^case0, ^dispatch1
+        ...
+        ^dispatchN: <pred for case N-1>; cf.cond_br pN-1, ^caseN-1,
+                                          ^default-or-exit
+        ^case0:     <body0>;  (cf.br ^case1 for fall-through, or
+                               cf.br ^exit for cir.break)
+        ...
+        ^caseN-1:   <bodyN-1>; (cf.br ^exit on break / cf.br ^next on FT)
+        ^default:   <default body>; (cf.br ^exit on break / fall through)
+        ^exit:      <continuation>
+    """
+    fn_state = program_state.getCurrentFnState()
+    if not fn_state.is_unstructured:
+        raise RuntimeError(
+            "cir-to-core: cir.switch requires unstructured function emission "
+            "(function-level scan should have flagged it)"
+        )
+    region = fn_state.function_region
+    assert region is not None
+    cur = fn_state.current_block
+    assert cur is not None
+
+    cond = ctx[op.condition]
+    if cond is None:
+        cond = op.condition
+
+    cases = _collect_switch_cases(op)
+    # Locate the default case (if any) and split out value-bearing cases.
+    default_idx: int | None = None
+    for i, c in enumerate(cases):
+        if c.kind.value.data == 0:  # default
+            if default_idx is not None:
+                raise RuntimeError(
+                    "cir-to-core: multiple cir.case(default) in one switch"
+                )
+            default_idx = i
+
+    # One body block per case in source order. The dispatch chain only
+    # tests value-bearing cases (kind != default); a non-matching cascade
+    # falls into the default block (or exit if there's no default).
+    case_blocks: list[Block] = []
+    for _ in cases:
+        b = Block()
+        region.add_block(b)
+        case_blocks.append(b)
+
+    exit_block = Block()
+    region.add_block(exit_block)
+
+    default_target = case_blocks[default_idx] if default_idx is not None else exit_block
+
+    # Wire dispatch from `cur` through a chain of compare-and-branch
+    # blocks. We emit the first predicate directly into `cur`; subsequent
+    # ones go into freshly-allocated dispatch blocks.
+    value_case_indices = [i for i, c in enumerate(cases) if c.kind.value.data != 0]
+
+    if not value_case_indices:
+        # `switch (...) { default: ...; }` — go straight to default/exit.
+        cur.add_op(cf.BranchOp(default_target))
+    else:
+        dispatch_block = cur
+        for j, case_idx in enumerate(value_case_indices):
+            case_op = cases[case_idx]
+            pred_ops, pred_val = _emit_match_predicate(cond, case_op)
+            for po in pred_ops:
+                dispatch_block.add_op(po)
+            is_last = j == len(value_case_indices) - 1
+            if is_last:
+                false_target = default_target
+            else:
+                false_target = Block()
+                region.add_block(false_target)
+            dispatch_block.add_op(
+                cf.ConditionalBranchOp(
+                    pred_val, case_blocks[case_idx], [], false_target, []
+                )
+            )
+            dispatch_block = false_target  # for next iteration (if any)
+
+    # Translate each case body. `cir.break` inside the case targets the
+    # exit block; `cir.yield` (fall-through) targets the next case block
+    # in source order, or the exit block if this is the last case.
+    fn_state.break_targets.append(exit_block)
+    try:
+        for i, case_op in enumerate(cases):
+            fn_state.current_block = case_blocks[i]
+            fn_state.block_terminated = False
+            case_ctx = SSAValueCtx(parent_scope=ctx)
+            _translate_region_into_block_unstructured(
+                program_state, case_ctx, case_op.case_region
+            )
+            if not fn_state.block_terminated:
+                # Implicit fall-through: branch to the next case body, or
+                # to the exit block if no further case follows.
+                fall_target = case_blocks[i + 1] if i + 1 < len(cases) else exit_block
+                assert fn_state.current_block is not None
+                fn_state.current_block.add_op(cf.BranchOp(fall_target))
+    finally:
+        fn_state.break_targets.pop()
+
+    fn_state.current_block = exit_block
+    fn_state.block_terminated = False
+    return []
+
+
+def translate_switch_flat(
+    program_state: ProgramState, ctx: SSAValueCtx, op: cir.SwitchFlatOp
+) -> list[Operation]:
+    """Lower the LLVM-style `cir.switch.flat` terminator.
+
+    `cir.switch.flat` carries:
+      * a condition operand (an integer)
+      * a `default` successor with optional operands
+      * a list of `(case_value, successor, operands)` tuples
+
+    The flat form is what clang's internal `cir-flatten-cfg` pass would
+    produce; our pipeline doesn't run that pass, so this handler is only
+    exercised from filecheck. We lower to a `cf.cond_br` chain that mirrors
+    the structured handler above but reuses the existing successor blocks
+    via `_block_map`.
+    """
+    fn_state = program_state.getCurrentFnState()
+    region = fn_state.function_region
+    assert region is not None
+    cur = fn_state.current_block
+    assert cur is not None
+
+    cond = ctx[op.condition]
+    if cond is None:
+        cond = op.condition
+
+    default_block = _lookup_block(program_state, op.successor[0])
+    default_args = _resolve_args(ctx, list(op.default_operands))
+    case_succ_blocks = [_lookup_block(program_state, s) for s in op.successor[1:]]
+    # Slice case_operands by the segments stored in case_operand_segments.
+    # `DenseArrayBase` over `IntegerType` yields ints from `iter_values`;
+    # we coerce explicitly to satisfy the type checker.
+    from typing import cast
+
+    from xdsl.dialects.builtin import DenseArrayBase
+
+    seg_attr = cast(DenseArrayBase[IntegerType], op.case_operand_segments)
+    seg_data: list[int] = [int(n) for n in seg_attr.iter_values()]
+    case_operands_flat = list(op.case_operands)
+    per_case_args: list[list[SSAValue]] = []
+    cursor = 0
+    for n in seg_data:
+        chunk = case_operands_flat[cursor : cursor + n]
+        cursor += n
+        per_case_args.append(_resolve_args(ctx, list(chunk)))
+    case_value_attrs = list(op.case_values.data)
+
+    cond_ty = cond.type
+    assert isa(cond_ty, IntegerType), (
+        f"cir-to-core: switch.flat condition must lower to integer, got {cond_ty}"
+    )
+
+    if not case_value_attrs:
+        cur.add_op(cf.BranchOp(default_block, *default_args))
+        fn_state.block_terminated = True
+        return []
+
+    dispatch_block: Block = cur
+    for j, val_attr in enumerate(case_value_attrs):
+        v_int = _case_value_as_int(val_attr)
+        cst = arith.ConstantOp(IntegerAttr(v_int, cond_ty), cond_ty)
+        cmp = arith.CmpiOp(cond, cst.results[0], 0)
+        dispatch_block.add_op(cst)
+        dispatch_block.add_op(cmp)
+        is_last = j == len(case_value_attrs) - 1
+        false_target: Block = default_block if is_last else Block()
+        false_args: list[SSAValue] = list(default_args) if is_last else []
+        if not is_last:
+            region.add_block(false_target)
+        dispatch_block.add_op(
+            cf.ConditionalBranchOp(
+                cmp.results[0],
+                case_succ_blocks[j],
+                per_case_args[j],
+                false_target,
+                false_args,
+            )
+        )
+        if is_last:
+            break
+        dispatch_block = false_target
+
+    fn_state.block_terminated = True
+    return []
 
 
 # Silence unused-import noise.
