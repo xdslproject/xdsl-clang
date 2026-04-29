@@ -75,27 +75,37 @@ def translate_load(
     chain_table = _index_chain(program_state)
     chain = chain_table.get(addr_cir, [])
 
-    # Pointer-to-record: emit llvm.load.
+    # Address is opaque `!llvm.ptr` — produced by `cir.alloca` of a record
+    # (whole-record load), `cir.get_member` (scalar/pointer field GEP), or
+    # `llvm.mlir.zero` for a null record/function/void* pointer. memref.load
+    # cannot index into !llvm.ptr, so fall back to llvm.load with the result
+    # type derived from the CIR result type.
     pointee = addr_cir.type.pointee  # type: ignore[attr-defined]
-    if isa(pointee, cir.RecordType):
-        struct_ty = convert_cir_type_to_standard(pointee, program_state)
-        new = llvm.LoadOp(addr, struct_ty)
+    if isa(addr.type, llvm.LLVMPointerType):
+        result_ty = convert_cir_type_to_standard(op.results[0].type, program_state)
+        new = llvm.LoadOp(addr, result_ty)
         ctx[op.results[0]] = new.results[0]
-        # The loaded record is not an addressable base for the chain
-        # mechanism — clear any inherited entry for hygiene.
         chain_table[op.results[0]] = []
         return [new]
     if isa(pointee, cir.PointerType):
-        # Loading a pointer through a pointer (e.g., `int *p` where p was
-        # spilled to the stack). The lowered addr is `memref<memref<...>>`;
-        # the load yields the inner memref descriptor.
-        new_ld = memref.LoadOp.get(addr, [])
+        # Loading a pointer through a pointer. Two sub-cases for the address:
+        #   * rank-0 `memref<memref<...>>` — a spilled-pointer slot; load
+        #     with no indices yields the inner descriptor.
+        #   * rank-1 `memref<?xmemref<...>>` — a decayed pointer-of-pointer
+        #     used directly as `*pp` (i.e. `pp[0]`); materialise index 0
+        #     just like the scalar case.
+        # The chain branch (e.g. `pp[i]`) goes through `_scalar_load_store_indices`
+        # implicitly via the chain path below.
+        if not chain:
+            prelude, indices = _scalar_load_store_indices(addr)
+            new_ld = memref.LoadOp.get(addr, indices)
+            ctx[op.results[0]] = new_ld.results[0]
+            # IMPORTANT: the loaded pointer is a fresh base for any subsequent
+            # `cir.ptr_stride` — see Phase 5 Task 5.6.
+            chain_table[op.results[0]] = []
+            return [*prelude, new_ld]
+        new_ld = memref.LoadOp.get(addr, list(chain))
         ctx[op.results[0]] = new_ld.results[0]
-        # IMPORTANT: the loaded pointer is a fresh base for any subsequent
-        # `cir.ptr_stride`. Reset its chain so it does not inherit one
-        # from the *address slot* (which is keyed on `addr_cir`, not on
-        # the loaded SSA value, but be defensive in case of future keying
-        # changes — see Phase 5 Task 5.6).
         chain_table[op.results[0]] = []
         return [new_ld]
     # Scalar / array element load.
@@ -158,14 +168,20 @@ def translate_store(
         and val.type.get_element_type() == addr.type.get_element_type()
     ):
         return [memref.CopyOp(val, addr)]
-    if isa(pointee, cir.RecordType):
+    # Address is opaque `!llvm.ptr` — record store, GEP-into-struct field,
+    # or null-pointer slot. Mirror the load path and emit llvm.store.
+    if isa(addr.type, llvm.LLVMPointerType):
         new = llvm.StoreOp(val, addr)
         return [new]
     if isa(pointee, cir.PointerType):
-        # Storing a pointer through a pointer slot (e.g., `*pp = q`). The
-        # destination `addr` is `memref<memref<...>>`, so the store has no
-        # element index. The slot itself is rank-0 (`memref<memref<...>>`).
-        new_s = memref.StoreOp.get(val, addr, [])
+        # Storing a pointer through a pointer slot (e.g., `*pp = q`).
+        # Same rank-0 vs rank-1 distinction as the load path: a rank-1
+        # decayed `memref<?xmemref<...>>` destination needs an index 0.
+        if not chain:
+            prelude, indices = _scalar_load_store_indices(addr)
+            new_s = memref.StoreOp.get(val, addr, indices)
+            return [*prelude, new_s]
+        new_s = memref.StoreOp.get(val, addr, list(chain))
         return [new_s]
     if not chain:
         # See `_scalar_load_store_indices` — a rank-1 destination with no

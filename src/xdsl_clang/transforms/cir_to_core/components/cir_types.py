@@ -112,8 +112,14 @@ def _convert_pointer(
     # the underlying memref<NxT> rather than memref<memref<NxT>>.
     if isa(pointee, cir.ArrayType):
         return convert_cir_type_to_standard(pointee, program_state)
-    # Scalar pointee
-    elem = convert_cir_type_to_standard(pointee, program_state, ptr_mode=SCALAR_PTR)
+    # Scalar pointee (or nested pointer). When the pointee is itself a
+    # `!cir.ptr`, recurse with DECAYED mode so that `T**` lowers uniformly
+    # to `memref<?xmemref<?xT>>` — matching the convention used by local
+    # pointer slots (`cir.alloca !cir.ptr<T>`) and by malloc results. This
+    # is what lets a loaded inner pointer be stored back into a local
+    # `T*` slot without a type mismatch (e.g. the dswap pattern).
+    inner_mode = DECAYED_PTR if isa(pointee, cir.PointerType) else SCALAR_PTR
+    elem = convert_cir_type_to_standard(pointee, program_state, ptr_mode=inner_mode)
     if ptr_mode.decayed:
         return builtin.MemRefType(elem, [DYNAMIC_INDEX])  # memref<?xT>
     return builtin.MemRefType(elem, [])  # memref<T>

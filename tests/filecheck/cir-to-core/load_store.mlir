@@ -3,6 +3,7 @@
 !s32i = !cir.int<s, 32>
 !s64i = !cir.int<s, 64>
 !f64  = !cir.double
+!rec_pair = !cir.record<struct "pair" {!s32i, !s64i}>
 
 module {
   cir.func @scalar_rw() -> !s32i {
@@ -44,4 +45,22 @@ module {
   }
   // CHECK:      func.func @cast_int2float(%[[X:.*]]: i32) -> f64 {
   // CHECK-NEXT:   %{{.*}} = arith.sitofp %[[X]] : i32 to f64
+
+  // F5: load/store of a scalar field reached via cir.get_member must use
+  // llvm.load / llvm.store, since the GEP returns !llvm.ptr — memref ops
+  // can't index into !llvm.ptr.
+  cir.func @get_member_rw() -> !s64i {
+    %p = cir.alloca !rec_pair, !cir.ptr<!rec_pair>, ["p"] {alignment = 8 : i64}
+    %c = cir.const #cir.int<7> : !s64i
+    %f = cir.get_member %p[1] {name = "second"} : !cir.ptr<!rec_pair> -> !cir.ptr<!s64i>
+    cir.store %c, %f : !s64i, !cir.ptr<!s64i>
+    %v = cir.load %f : !cir.ptr<!s64i>, !s64i
+    cir.return %v : !s64i
+  }
+  // CHECK:      func.func @get_member_rw() -> i64 {
+  // CHECK:        %[[P:.*]] = "llvm.alloca"
+  // CHECK-NEXT:   %[[C:.*]] = arith.constant 7 : i64
+  // CHECK-NEXT:   %[[F:.*]] = "llvm.getelementptr"(%[[P]])
+  // CHECK-NEXT:   "llvm.store"(%[[C]], %[[F]])
+  // CHECK-NEXT:   %{{.*}} = "llvm.load"(%[[F]])
 }

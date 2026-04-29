@@ -51,12 +51,13 @@ EXPECTED_FAIL = {
     # is passed to a function whose `int *b` arg lowers to rank-1
     # `memref<?xi32>` — separate Task 5.5 follow-up.
     "fragments/procedures.c",
-    # heavy benchmarks — Phase 5. `tra_adv.c` builds and runs end-to-end
-    # but the kernel is a heavy numerical simulation that exceeds the
-    # harness's per-test runtime budget. `swm/swm*.c` still hit a
-    # `cir.load` of a struct field via `cir.get_member` returning
-    # `!llvm.ptr` — needs an `llvm.load` fallback for `!llvm.ptr`-typed
-    # addresses (struct-field handling — separate blocker).
+    # heavy benchmarks — Phase 5. `tra_adv.c` and `swm/swm.c` build and
+    # run end-to-end after Task F5 (llvm.load/store via cir.get_member),
+    # but the kernels are heavy numerical simulations that exceed the
+    # harness's per-test runtime budget — Task F4. `swm/swm_orig.c`
+    # additionally needs Task F3 (rank-0 → rank-1 memref.cast at internal
+    # call sites — `dswap(&u, &unew)` passes `memref<memref<?xf32>>` for a
+    # `memref<?xmemref<?xf32>>` arg).
     "advection/tra_adv.c",
     "swm/swm.c",
     "swm/swm_orig.c",
