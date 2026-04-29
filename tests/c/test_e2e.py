@@ -42,7 +42,6 @@ RUN_TIMEOUTS = {
 # Phase 5 hardening turns these into xpass — list of test ids that we
 # expect to fail (strict=False so xpass doesn't error).
 EXPECTED_FAIL = {
-    "fragments/array_ops.c",  # malloc/free void* bitcast
     # `tra_adv.c` builds and runs but the 1024×512×512 NEMO advection
     # kernel allocates ~25 GB of memref descriptors and exceeds any
     # reasonable per-test runtime budget — needs the smaller-fixture
