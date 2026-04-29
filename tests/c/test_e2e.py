@@ -42,13 +42,7 @@ RUN_TIMEOUTS = {
 # Phase 5 hardening turns these into xpass — list of test ids that we
 # expect to fail (strict=False so xpass doesn't error).
 EXPECTED_FAIL = {
-    # `allocatables.c` lowers its const-array init but trips a different
-    # downstream blocker — `static float *global_array = NULL;` lowers to
-    # `memref<memref<f32>>` while malloc emits `memref<?xf32>`, so the
-    # global-pointer assignment fails type matching. Tracked as Task F2.
-    "fragments/allocatables.c",
     "fragments/array_ops.c",  # malloc/free void* bitcast
-    "fragments/pointers.c",
     # `tra_adv.c` builds and runs but the 1024×512×512 NEMO advection
     # kernel allocates ~25 GB of memref descriptors and exceeds any
     # reasonable per-test runtime budget — needs the smaller-fixture

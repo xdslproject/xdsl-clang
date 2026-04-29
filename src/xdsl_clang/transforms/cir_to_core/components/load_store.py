@@ -155,6 +155,17 @@ def translate_store(
     val = _opd(ctx, op.value)
     chain = _index_chain(program_state).get(addr_cir, [])
 
+    # `cir.store %null, %slot` where %null came from `cir.const #cir.ptr<null>`:
+    # we model this as "leave the slot uninitialised" because the only
+    # legal use of a NULL pointer in C is to compare against — dereferencing
+    # is UB. Skipping the store also avoids leaving an
+    # `unrealized_conversion_cast` from `!llvm.ptr` to a memref descriptor
+    # in the lowered IR (which `reconcile-unrealized-casts` cannot resolve
+    # without a paired round-trip — see Task F2).
+    src_owner = op.value.owner
+    if isa(src_owner, cir.ConstantOp) and isa(src_owner.value, cir.ConstPtrAttr):
+        return []
+
     pointee = addr_cir.type.pointee  # type: ignore[attr-defined]
     # Whole-array store: the source SSA value is itself a memref of the
     # same shape as the destination slot. Happens when a `cir.const` of

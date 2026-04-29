@@ -30,6 +30,7 @@ from xdsl.utils.hints import isa
 
 from xdsl_clang.dialects import cir
 from xdsl_clang.transforms.cir_to_core.components.cir_types import (
+    DECAYED_PTR,
     SCALAR_PTR,
     convert_cir_type_to_standard,
 )
@@ -125,8 +126,15 @@ def translate_get_global(
     if isa(cir_ty, cir.ArrayType):
         target_ty = convert_cir_type_to_standard(cir_ty, program_state)
     else:
-        # scalar global — must be a memref<T>
-        target_ty = MemRefType(convert_cir_type_to_standard(cir_ty, program_state), [])
+        # Scalar / pointer global — must be a memref<T>. Pointer-typed
+        # globals follow the decayed-pointer convention so the slot's
+        # element type matches local pointer slots and malloc results
+        # (Task F2). Non-pointer scalars fall through with SCALAR_PTR.
+        inner_mode = DECAYED_PTR if isa(cir_ty, cir.PointerType) else SCALAR_PTR
+        target_ty = MemRefType(
+            convert_cir_type_to_standard(cir_ty, program_state, ptr_mode=inner_mode),
+            [],
+        )
     assert isa(target_ty, MemRefType[Attribute])
     new = memref.GetGlobalOp(sym, target_ty)
     ctx[op.results[0]] = new.results[0]
@@ -234,11 +242,18 @@ def translate_global(
             )
         ]
 
-    # Scalar/array → memref.global where possible.
+    # Scalar/array → memref.global where possible. Pointer-typed globals
+    # use DECAYED_PTR so the slot's element type matches local pointer
+    # slots and malloc results (Task F2) — `static int *p = NULL;`
+    # becomes `memref.global @p : memref<memref<?xi32>>`.
     if isa(cir_ty, cir.ArrayType):
         target_ty = convert_cir_type_to_standard(cir_ty, program_state)
     else:
-        target_ty = MemRefType(convert_cir_type_to_standard(cir_ty, program_state), [])
+        inner_mode = DECAYED_PTR if isa(cir_ty, cir.PointerType) else SCALAR_PTR
+        target_ty = MemRefType(
+            convert_cir_type_to_standard(cir_ty, program_state, ptr_mode=inner_mode),
+            [],
+        )
     assert isa(target_ty, MemRefType[Attribute])
 
     init_attr: Attribute | None = None

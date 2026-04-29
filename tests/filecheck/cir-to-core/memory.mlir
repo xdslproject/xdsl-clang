@@ -36,4 +36,18 @@ module {
   }
   // CHECK:      func.func @load_global() -> i32 {
   // CHECK-NEXT:   %{{.*}} = memref.get_global @gi : memref<i32>
+
+  // Task F2: pointer-typed globals must use the decayed-pointer convention
+  // for their slot's element type — `static float *gp = NULL;` lowers to
+  // `memref.global @gp : memref<memref<?xf32>>` so a stored malloc result
+  // (`memref<?xf32>`) round-trips cleanly.
+  cir.global external @gp = #cir.ptr<null> : !cir.ptr<!f32>
+  // CHECK:      "memref.global"() <{sym_name = "gp", type = memref<memref<?xf32>>
+
+  cir.func @load_ptr_global() {
+    %g = cir.get_global @gp : !cir.ptr<!cir.ptr<!f32>>
+    cir.return
+  }
+  // CHECK:      func.func @load_ptr_global() {
+  // CHECK-NEXT:   %{{.*}} = memref.get_global @gp : memref<memref<?xf32>>
 }
