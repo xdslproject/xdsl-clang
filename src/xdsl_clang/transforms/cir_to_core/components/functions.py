@@ -66,6 +66,22 @@ def _has_break_or_continue_anywhere(op: cir.FuncOp) -> bool:
     return False
 
 
+def _has_dowhile_anywhere(op: cir.FuncOp) -> bool:
+    """True iff the function body contains a `cir.do` (do-while) at any
+    nesting depth.
+
+    Task 5.8: do-while has body-then-cond shape, which doesn't map cleanly to
+    `scf.while` (cond-then-body). We always lower it through the unstructured
+    `cf.br` / `cf.cond_br` block-graph emitter, so the surrounding function
+    must run in unstructured mode regardless of whether it also contains
+    break/continue or a nested return.
+    """
+    for inner in op.walk():
+        if isa(inner, cir.DoWhileOp):
+            return True
+    return False
+
+
 def _has_nested_return(op: cir.FuncOp) -> bool:
     """True iff a `cir.return` appears inside any *nested* region of the
     function body (e.g. inside a `cir.if` or `cir.scope`). Returns at the
@@ -145,9 +161,11 @@ def translate_function(
     setattr(program_state, "_block_map", block_map)
     fn_state.function_region = new_region
     fn_state.entry_block = block_map[op.body.blocks[0]] if op.body.blocks else None
-    fn_state.is_unstructured = _has_break_or_continue_anywhere(
-        op
-    ) or _has_nested_return(op)
+    fn_state.is_unstructured = (
+        _has_break_or_continue_anywhere(op)
+        or _has_nested_return(op)
+        or _has_dowhile_anywhere(op)
+    )
     try:
         from xdsl_clang.transforms.cir_to_core import statements
 

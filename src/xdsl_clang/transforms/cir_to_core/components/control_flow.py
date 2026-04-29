@@ -377,7 +377,16 @@ def translate_while(
 def translate_dowhile(
     program_state: ProgramState, ctx: SSAValueCtx, op: cir.DoWhileOp
 ) -> list[Operation]:
-    return _todo("do-while")
+    """Lower `cir.do` (do-while) to a block-graph using `cf.br` / `cf.cond_br`.
+
+    Task 5.8: do-while runs the body once before evaluating the condition,
+    which doesn't map cleanly to `scf.while` (cond-then-body). We always
+    route through the unstructured emitter — the surrounding function is
+    flagged `is_unstructured` by `_has_dowhile_anywhere`.
+    """
+    return _build_unstructured_dowhile(
+        program_state, ctx, op.body_region, op.cond_region
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +446,12 @@ def _build_unstructured_loop(
     `cir.continue` branches to `^step` (for) or `^header` (while).
     """
     if body_first:
-        raise NotImplementedError("cir-to-core: cir.do unstructured emitter (Task 5.8)")
+        # `cir.do` has its own dedicated emitter (`_build_unstructured_dowhile`)
+        # because the block layout differs (no separate cond region; cond
+        # follows the body). Callers shouldn't reach this path.
+        raise RuntimeError(
+            "cir-to-core: body_first should route to _build_unstructured_dowhile"
+        )
 
     fn_state = program_state.getCurrentFnState()
     if not fn_state.is_unstructured:
@@ -511,6 +525,88 @@ def _build_unstructured_loop(
         if not fn_state.block_terminated:
             assert fn_state.current_block is not None
             fn_state.current_block.add_op(cf.BranchOp(header))
+
+    # Caller continues in the exit block.
+    fn_state.current_block = exit_block
+    fn_state.block_terminated = False
+    return []
+
+
+def _build_unstructured_dowhile(
+    program_state: ProgramState,
+    ctx: SSAValueCtx,
+    body_region: Region,
+    cond_region: Region,
+) -> list[Operation]:
+    """Lower a `cir.do` (do-while) to a block graph using `cf` ops (Task 5.8).
+
+    Layout:
+        cur:     cf.br ^body          (entry: body always runs once)
+        ^body:   <body>; cf.br ^header
+        ^header: <cond>; cf.cond_br %c, ^body, ^exit
+        ^exit:   <continuation — caller threads subsequent ops here>
+
+    `cir.break` inside the body branches to `^exit`.
+    `cir.continue` inside the body branches to `^header` (cond eval), as in
+    standard C semantics — `continue` in a do-while skips to the test.
+    """
+    fn_state = program_state.getCurrentFnState()
+    if not fn_state.is_unstructured:
+        raise RuntimeError(
+            "cir-to-core: unstructured do-while emitter invoked outside an "
+            "unstructured function (function detection should have flagged it)"
+        )
+    region = fn_state.function_region
+    assert region is not None
+    cur = fn_state.current_block
+    assert cur is not None
+
+    body = Block()
+    header = Block()
+    exit_block = Block()
+
+    region.add_block(body)
+    region.add_block(header)
+    region.add_block(exit_block)
+
+    # Enter the loop: body runs unconditionally on first iteration.
+    cur.add_op(cf.BranchOp(body))
+
+    # ---- body ----
+    fn_state.break_targets.append(exit_block)
+    fn_state.continue_targets.append(header)
+    try:
+        fn_state.current_block = body
+        fn_state.block_terminated = False
+        body_ctx = SSAValueCtx(parent_scope=ctx)
+        _translate_region_into_block_unstructured(program_state, body_ctx, body_region)
+        if not fn_state.block_terminated:
+            assert fn_state.current_block is not None
+            fn_state.current_block.add_op(cf.BranchOp(header))
+    finally:
+        fn_state.break_targets.pop()
+        fn_state.continue_targets.pop()
+
+    # ---- header (cond) ----
+    fn_state.current_block = header
+    fn_state.block_terminated = False
+    cond_ctx = SSAValueCtx(parent_scope=ctx)
+    _translate_region_into_block_unstructured(program_state, cond_ctx, cond_region)
+    cond_term = list(cond_region.block.ops)[-1] if cond_region.block.ops else None
+    if cond_term is None or not isa(cond_term, cir.ConditionOp):
+        raise NotImplementedError(
+            "cir-to-core: malformed do-while cond region (no cir.condition terminator)"
+        )
+    cond_val = cond_ctx[cond_term.cond]
+    if cond_val is None:
+        cond_val = cond_term.cond
+    if fn_state.current_block is None:  # type: ignore[reportUnnecessaryComparison]
+        raise RuntimeError(
+            "cir-to-core: cond region nulled current_block in do-while emitter"
+        )
+    fn_state.current_block.add_op(
+        cf.ConditionalBranchOp(cond_val, body, [], exit_block, [])
+    )
 
     # Caller continues in the exit block.
     fn_state.current_block = exit_block

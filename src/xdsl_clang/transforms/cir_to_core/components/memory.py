@@ -127,11 +127,23 @@ def _route_static_allocas(
     If there is no entry block (shouldn't happen for any well-formed
     function, but be conservative), return the ops as usual so the
     dispatcher places them at the cursor.
+
+    In unstructured-function mode the entry block may already have a
+    terminator (e.g. `cf.br ^header` from the loop emitter). When that
+    happens we insert the hoisted alloca *before* the terminator so the
+    block stays well-formed.
     """
+    from xdsl.traits import IsTerminator
+
     if entry_block is None:
         return ops
-    for o in ops:
-        entry_block.add_op(o)
+    last = entry_block.last_op
+    if last is not None and last.has_trait(IsTerminator):
+        for o in ops:
+            entry_block.insert_op_before(o, last)
+    else:
+        for o in ops:
+            entry_block.add_op(o)
     return []
 
 
